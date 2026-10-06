@@ -1,0 +1,19 @@
+@import './base.css';
+
+/* 1. 清除全頁與瀏覽器邊距 */
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden; /* 避免最外層出現全頁滾動條 */
+}
+
+/* 2. 讓 Vue 根容器滿版貼齊 */
+#app {
+  width: 100%;
+  height: 100dvh;
+  margin: 0;
+  padding: 0;
+  max-width: none; /* 清除 Vite 預設的最大寬度限制 */
+}

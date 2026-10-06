@@ -1,0 +1,1 @@
+D:\TFS-Kevin\GP\BadmintonApp.Client\obj\Debug\badmintonapp.client.esproj.CoreCompileInputs.cache
