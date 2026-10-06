@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="../BadmintonApp.Client/badmintonapp.client.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+  <Project Path="BadmintonApp.API.csproj" />
+</Solution>

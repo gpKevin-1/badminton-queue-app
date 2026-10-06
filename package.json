@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@types/sortablejs": "^1.15.9",
+    "axios": "^1.20.0",
+    "sortablejs": "^1.15.7"
+  }
+}
