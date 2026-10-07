@@ -24,9 +24,12 @@
     elapsedSeconds?: number;
   }
 
-  // --- 2. 狀態宣告 ---
+  // --- 2. 判斷環境與狀態宣告 ---
 
-  const API_BASE_URL = 'https://localhost:7206/api/players';
+  // 自動判斷目前是開發環境 (npm run dev) 還是正式上線環境 (npm run build)
+  const isDev = import.meta.env.DEV; 
+  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://badminton-api-bqbs.onrender.com/api/players';
+  const STORAGE_KEY = 'badminton_queue_players_data';
 
   const queuePlayers = ref<Player[]>([]);
   const isLoading = ref<boolean>(false);
@@ -75,17 +78,45 @@
     }))
   );
 
-  // --- 3. 等待佇列排序與分區計算 ---
+  // --- 3. localStorage 輔助函式 (僅在生產環境或 API 失敗時使用) ---
+
+  const saveToLocalStorage = () => {
+    if (!isDev) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(queuePlayers.value));
+    }
+  };
+
+  const loadFromLocalStorage = (): Player[] => {
+    const data = localStorage.getItem(STORAGE_KEY);
+    if (data) {
+      try {
+        return JSON.parse(data);
+      } catch (e) {
+        console.error('解析 localStorage 失敗:', e);
+      }
+    }
+    // 預設初始靜態資料
+    return [
+      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1' },
+      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1' },
+      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1' },
+      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1' },
+      { id: 5, name: '李洋', gender: 'M', playedCount: 0, level: '12', status: '1' },
+      { id: 6, name: '王齊麟', gender: 'M', playedCount: 0, level: '12', status: '1' },
+      { id: 7, name: '球友A', gender: 'M', playedCount: 1, level: '8', status: '1' },
+      { id: 8, name: '球友B', gender: 'F', playedCount: 0, level: '4', status: '0' }
+    ];
+  };
+
+  // --- 4. 等待佇列排序與分區計算 ---
 
   const queueGroupMode = ref<'level' | 'playedCount' | 'resting'>('level');
 
-  // 切換 Tab 時，自動重置批次選取的狀態
   const toggleGroupMode = (mode: 'level' | 'playedCount' | 'resting') => {
     queueGroupMode.value = mode;
     selectedPlayerIds.value = [];
   };
 
-  // 核心：根據目前 Tab 判定該 Tab 的所有目標選手對象
   const currentTabPlayers = computed(() => {
     if (queueGroupMode.value === 'resting') {
       return queuePlayers.value.filter(p => String(p.status) === '0');
@@ -159,33 +190,29 @@
     collapsedGroups.value[key] = !collapsedGroups.value[key];
   };
 
-  // --- 4. API 與初始化 ---
+  // --- 5. 初始化與 API / 本地資料載入 ---
 
   const fetchPlayersFromAPI = async () => {
+    // 情況 A：正式發布環境 (Production) -> 純前端 localStorage 模式
+    if (!isDev) {
+      queuePlayers.value = loadFromLocalStorage();
+      return;
+    }
+
+    // 情況 B：本地開發環境 (Development) -> 發送 HTTP API 請求
     try {
       isLoading.value = true;
       const response = await axios.get<Player[]>(API_BASE_URL);
       queuePlayers.value = response.data;
     } catch (error) {
-      console.error('API 連線失敗，載入預設靜態資料:', error);
-      if (queuePlayers.value.length === 0) {
-        queuePlayers.value = [
-          { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1' },
-          { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1' },
-          { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1' },
-          { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1' },
-          { id: 5, name: '李洋', gender: 'M', playedCount: 0, level: '12', status: '1' },
-          { id: 6, name: '王齊麟', gender: 'M', playedCount: 0, level: '12', status: '1' },
-          { id: 7, name: '球友A', gender: 'M', playedCount: 1, level: '8', status: '1' },
-          { id: 8, name: '球友B', gender: 'F', playedCount: 0, level: '4', status: '0' }
-        ];
-      }
+      console.error('API 連線失敗，載入預設資料:', error);
+      queuePlayers.value = loadFromLocalStorage();
     } finally {
       isLoading.value = false;
     }
   };
 
-  // --- 5. 計時器邏輯 ---
+  // --- 6. 計時器邏輯 ---
 
   const timerInterval = ref<ReturnType<typeof setInterval> | null>(null);
 
@@ -217,7 +244,7 @@
     if (timerInterval.value) clearInterval(timerInterval.value);
   });
 
-  // --- 6. 拖曳連動處理 (Drag & Drop Sync) ---
+  // --- 7. 拖曳連動處理 (Drag & Drop Sync) ---
 
   const getDraggedPlayer = (evt: any): Player | null => {
     return evt?.item?._underlying_vm_ || evt?.draggedContext?.element || null;
@@ -230,6 +257,7 @@
     const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
     if (idx !== -1) {
       queuePlayers.value.splice(idx, 1);
+      saveToLocalStorage();
     }
   };
 
@@ -244,10 +272,11 @@
 
     if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
       queuePlayers.value.push(player);
+      saveToLocalStorage();
     }
   };
 
-  // --- 7. 選手 CRUD 與動態批次操作 ---
+  // --- 8. 選手 CRUD 與動態批次操作 ---
 
   const openAddModal = () => {
     newPlayer.value = { name: '', gender: 'M', playedCount: 0, level: '5', status: '1' };
@@ -259,8 +288,8 @@
   const saveNewPlayer = async () => {
     if (!newPlayer.value.name.trim()) return alert('請輸入選手姓名！');
 
-    const payload = {
-      id: "",
+    const localNewPlayer: Player = {
+      id: Date.now(),
       name: newPlayer.value.name.trim(),
       gender: newPlayer.value.gender,
       playedCount: Number(newPlayer.value.playedCount || 0),
@@ -268,11 +297,24 @@
       status: newPlayer.value.status || '1'
     };
 
-    try {
-      const response = await axios.post<Player>(API_BASE_URL, payload);
-      queuePlayers.value.push(response.data);
-    } catch (err) {
-      queuePlayers.value.push({ id: Date.now(), ...newPlayer.value });
+    if (isDev) {
+      const payload = {
+        id: "",
+        name: localNewPlayer.name,
+        gender: localNewPlayer.gender,
+        playedCount: localNewPlayer.playedCount,
+        level: localNewPlayer.level,
+        status: localNewPlayer.status
+      };
+      try {
+        const response = await axios.post<Player>(API_BASE_URL, payload);
+        queuePlayers.value.push(response.data);
+      } catch (err) {
+        queuePlayers.value.push(localNewPlayer);
+      }
+    } else {
+      queuePlayers.value.push(localNewPlayer);
+      saveToLocalStorage();
     }
     closeAddModal();
   };
@@ -291,24 +333,32 @@
     if (!editingPlayer.value) return;
     const targetId = editingPlayer.value.id;
 
-    const payload = {
-      id: String(targetId),
-      name: editingPlayer.value.name.trim(),
-      gender: editingPlayer.value.gender,
-      playedCount: Number(editingPlayer.value.playedCount),
-      level: String(editingPlayer.value.level),
-      status: editingPlayer.value.status
-    };
+    if (isDev) {
+      const payload = {
+        id: String(targetId),
+        name: editingPlayer.value.name.trim(),
+        gender: editingPlayer.value.gender,
+        playedCount: Number(editingPlayer.value.playedCount),
+        level: String(editingPlayer.value.level),
+        status: editingPlayer.value.status
+      };
 
-    try {
-      await axios.put(`${API_BASE_URL}/${targetId}`, payload);
+      try {
+        await axios.put(`${API_BASE_URL}/${targetId}`, payload);
+        queuePlayers.value = queuePlayers.value.map(p => 
+          String(p.id) === String(targetId) ? { ...editingPlayer.value! } : p
+        );
+      } catch (err) {
+        alert('更新失敗，請檢查網路連線！');
+        return;
+      }
+    } else {
       queuePlayers.value = queuePlayers.value.map(p => 
         String(p.id) === String(targetId) ? { ...editingPlayer.value! } : p
       );
-      closeEditModal();
-    } catch (err) {
-      alert('更新失敗，請檢查網路連線！');
+      saveToLocalStorage();
     }
+    closeEditModal();
   };
 
   const toggleBatchMode = () => {
@@ -316,12 +366,11 @@
     selectedPlayerIds.value = [];
   };
 
-  // 選擇選手判斷：確保選取的選手屬於目前 Tab
   const toggleSelectPlayer = (player: Player) => {
     const isRestingTab = queueGroupMode.value === 'resting';
     const isPlayerResting = String(player.status) === '0';
 
-    if (isRestingTab !== isPlayerResting) return; // 不屬於當前 Tab 的對象不可選取
+    if (isRestingTab !== isPlayerResting) return;
 
     const index = selectedPlayerIds.value.indexOf(player.id);
     if (index > -1) {
@@ -331,7 +380,6 @@
     }
   };
 
-  // 全選/全不選：僅對目前 Tab 的所有選手生效
   const toggleSelectAll = () => {
     const targetIds = currentTabPlayers.value.map(p => p.id);
     if (selectedPlayerIds.value.length === targetIds.length && targetIds.length > 0) {
@@ -345,25 +393,29 @@
     if (selectedPlayerIds.value.length === 0) return;
     const targetPlayers = queuePlayers.value.filter(p => selectedPlayerIds.value.includes(p.id));
 
-    await Promise.all(targetPlayers.map(async (player) => {
-      player.status = targetStatus;
-      try {
-        await axios.put(`${API_BASE_URL}/${player.id}`, {
-          id: String(player.id),
-          name: player.name,
-          gender: player.gender,
-          playedCount: Number(player.playedCount),
-          level: String(player.level),
-          status: targetStatus
-        });
-      } catch (err) { console.warn(err); }
-    }));
+    targetPlayers.forEach(p => p.status = targetStatus);
+
+    if (isDev) {
+      await Promise.all(targetPlayers.map(async (player) => {
+        try {
+          await axios.put(`${API_BASE_URL}/${player.id}`, {
+            id: String(player.id),
+            name: player.name,
+            gender: player.gender,
+            playedCount: Number(player.playedCount),
+            level: String(player.level),
+            status: targetStatus
+          });
+        } catch (err) { console.warn(err); }
+      }));
+    } else {
+      saveToLocalStorage();
+    }
 
     selectedPlayerIds.value = [];
     isBatchMode.value = false;
   };
 
-  // 批次場次歸零
   const batchResetPlayedCount = async () => {
     if (selectedPlayerIds.value.length === 0) return;
     if (!confirm(`確定要將選中的 ${selectedPlayerIds.value.length} 位選手已打場數歸零嗎？`)) return;
@@ -371,19 +423,24 @@
     isLoading.value = true;
     const targetPlayers = queuePlayers.value.filter(p => selectedPlayerIds.value.includes(p.id));
 
-    await Promise.all(targetPlayers.map(async (player) => {
-      player.playedCount = 0;
-      try {
-        await axios.put(`${API_BASE_URL}/${player.id}`, {
-          id: String(player.id),
-          name: player.name,
-          gender: player.gender,
-          playedCount: 0,
-          level: String(player.level),
-          status: player.status || '1'
-        });
-      } catch (err) { console.warn(err); }
-    }));
+    targetPlayers.forEach(p => p.playedCount = 0);
+
+    if (isDev) {
+      await Promise.all(targetPlayers.map(async (player) => {
+        try {
+          await axios.put(`${API_BASE_URL}/${player.id}`, {
+            id: String(player.id),
+            name: player.name,
+            gender: player.gender,
+            playedCount: 0,
+            level: String(player.level),
+            status: player.status || '1'
+          });
+        } catch (err) { console.warn(err); }
+      }));
+    } else {
+      saveToLocalStorage();
+    }
 
     isLoading.value = false;
     selectedPlayerIds.value = [];
@@ -395,17 +452,22 @@
     if (!confirm(`確定要刪除選中的 ${selectedPlayerIds.value.length} 位選手嗎？`)) return;
 
     const idsToDelete = [...selectedPlayerIds.value];
-    await Promise.all(idsToDelete.map(async id => {
-      try { await axios.delete(`${API_BASE_URL}/${id}`); }
-      catch (err) { console.warn(err); }
-    }));
+
+    if (isDev) {
+      await Promise.all(idsToDelete.map(async id => {
+        try { await axios.delete(`${API_BASE_URL}/${id}`); }
+        catch (err) { console.warn(err); }
+      }));
+    }
 
     queuePlayers.value = queuePlayers.value.filter(p => !idsToDelete.includes(p.id));
+    saveToLocalStorage();
+
     selectedPlayerIds.value = [];
     isBatchMode.value = false;
   };
 
-  // --- 8. 自動配對與場地管理 ---
+  // --- 9. 自動配對與場地管理 ---
 
   const isPreferredLevel = (courtPlayers: Player[], targetPlayer: Player): boolean => {
     if (courtPlayers.length === 0) return true;
@@ -439,6 +501,8 @@
       fillZone('nextPlayers', true);
       fillZone('nextPlayers', false);
     }
+
+    saveToLocalStorage();
   };
 
   const autoAssignAllCourts = () => {
@@ -463,6 +527,7 @@
           }
         });
       });
+      saveToLocalStorage();
     }
   };
 
@@ -479,6 +544,7 @@
     if (index !== -1) {
       queuePlayers.value.splice(index, 1);
       targetCourt[zone].push(player);
+      saveToLocalStorage();
     }
   };
 
@@ -497,22 +563,24 @@
 
     isLoading.value = true;
     try {
-      const updatedPlayers = await Promise.all(court.players.map(async (player) => {
-        player.playedCount += 1;
-        try {
-          await axios.put(`${API_BASE_URL}/${player.id}`, {
-            id: String(player.id),
-            name: player.name,
-            gender: player.gender,
-            playedCount: player.playedCount,
-            level: String(player.level),
-            status: player.status || '1'
-          });
-        } catch (err) { console.warn(err); }
-        return player;
-      }));
+      court.players.forEach(p => p.playedCount += 1);
 
-      updatedPlayers.forEach(p => {
+      if (isDev) {
+        await Promise.all(court.players.map(async (player) => {
+          try {
+            await axios.put(`${API_BASE_URL}/${player.id}`, {
+              id: String(player.id),
+              name: player.name,
+              gender: player.gender,
+              playedCount: player.playedCount,
+              level: String(player.level),
+              status: player.status || '1'
+            });
+          } catch (err) { console.warn(err); }
+        }));
+      }
+
+      court.players.forEach(p => {
         if (!queuePlayers.value.some(existing => String(existing.id) === String(p.id))) {
           queuePlayers.value.push(p);
         }
@@ -525,6 +593,7 @@
       court.elapsedSeconds = 0;
 
       fillCourtAuto(court);
+      saveToLocalStorage();
     } finally {
       isLoading.value = false;
     }
@@ -553,28 +622,30 @@
       }
     });
 
-    try {
-      await Promise.all(
-        playersToReturn.map(async (player) => {
-          await axios.put(`${API_BASE_URL}/${player.id}`, {
-            id: String(player.id),
-            name: player.name,
-            gender: player.gender,
-            playedCount: Number(player.playedCount),
-            level: String(player.level),
-            status: player.status || '1'
-          });
-        })
-      );
-    } catch (err) {
-      console.error('清空場地時同步後端失敗：', err);
-      alert('部分球員狀態同步至後端失敗，請檢查網路連線！');
-    } finally {
-      isLoading.value = false;
+    if (isDev) {
+      try {
+        await Promise.all(
+          playersToReturn.map(async (player) => {
+            await axios.put(`${API_BASE_URL}/${player.id}`, {
+              id: String(player.id),
+              name: player.name,
+              gender: player.gender,
+              playedCount: Number(player.playedCount),
+              level: String(player.level),
+              status: player.status || '1'
+            });
+          })
+        );
+      } catch (err) {
+        console.error('清空場地時同步後端失敗：', err);
+      }
     }
+
+    saveToLocalStorage();
+    isLoading.value = false;
   };
 
-  // --- 9. 輔助設定 ---
+  // --- 10. 輔助設定 ---
 
   const dragOptions = computed(() => ({
     animation: 200,
@@ -594,7 +665,12 @@
   <div class="app-main-layout">
     <header class="app-header">
       <div class="header-content">
-        <h1 class="app-title">🏸 羽球場邊排點看板</h1>
+        <h1 class="app-title">
+          🏸 羽球場邊排點看板 
+          <span class="mode-badge" :class="isDev ? 'dev' : 'prod'">
+            {{ isDev ? '⚡ 本地開發 API 模式' : '💾 正式離線暫存模式' }}
+          </span>
+        </h1>
         <div class="header-controls">
           <button class="btn-add-player" @click="openAddModal">➕ 選手報名</button>
           <button class="btn-auto-assign" @click="autoAssignAllCourts">⚡ 一鍵自動排點</button>
@@ -692,7 +768,7 @@
             </button>
           </div>
 
-          <!-- 分區 Tab (切換時自動清空選擇狀態) -->
+          <!-- 分區 Tab -->
           <div class="group-mode-switch">
             <span class="switch-label">分區方式：</span>
             <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'level' }" @click="toggleGroupMode('level')">
@@ -706,14 +782,13 @@
             </button>
           </div>
 
-          <!-- 批次操作工具列 (根據目前 Tab 動態切換功能與目標對象) -->
+          <!-- 批次操作工具列 -->
           <div v-if="isBatchMode" class="batch-actions-bar">
             <button class="btn-batch-select-all" @click="toggleSelectAll">
               {{ selectedPlayerIds.length === currentTabPlayers.length && currentTabPlayers.length > 0 ? '全不選' : '全選本頁' }}
             </button>
             <span class="selected-count">已選 {{ selectedPlayerIds.length }} 人</span>
             <div class="batch-btns">
-              <!-- 在「休息中」頁籤顯示【設為上場】；在其他頁籤顯示【設為休息】 -->
               <button v-if="queueGroupMode === 'resting'" class="btn-batch-active" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('1')">🟢 設為上場</button>
               <button v-else class="btn-batch-rest" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('0')">💤 設為休息</button>
 
@@ -854,6 +929,26 @@
     </div>
   </div>
 </template>
+
+<style scoped>
+.mode-badge {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.mode-badge.dev {
+  background-color: #fff3cd;
+  color: #856404;
+  border: 1px solid #ffeeba;
+}
+.mode-badge.prod {
+  background-color: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+</style>
 
 <style scoped>
   .app-main-layout {
