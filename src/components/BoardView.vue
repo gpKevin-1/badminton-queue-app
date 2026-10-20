@@ -10,8 +10,18 @@ export interface Player {
   playedCount: number;
   level: string; // 1 ~ 15 級
   status?: '1' | '0'; // '1': 排隊中/比賽中, '0': 休息/請假
-  sessions: string[]; // 選手報名的時段標籤 (例: ['18:00-20:00', '20:00-22:00'])
+  sessions: string[]; // 選手報名的時段標籤
   partnerId?: number | string | null; // 👥 綁定搭檔 ID
+  queueEnteredAt?: number | null;     // ⏳ 進入等待佇列的時間戳記（計算等待時間）
+  lastMatchPeers?: string[];          // 🎾 上局同場的球員姓名列表
+  avoidIds?: (number | string)[];     // ⛔ 需要錯開（不希望同場）的球員 ID 列表
+}
+
+export interface MatchHistoryRecord {
+  id: string;
+  timestamp: number;
+  courtName: string;
+  playerNames: string[];
 }
 
 export interface Court {
@@ -46,14 +56,12 @@ const parseTimeSlot = (slotStr: string): number => {
 // --- 2. 狀態宣告 ---
 const STORAGE_KEY_PLAYERS = 'badminton_queue_players_data';
 const STORAGE_KEY_CONFIG = 'badminton_queue_config_data';
+const STORAGE_KEY_HISTORY = 'badminton_queue_history_data';
 
-// 預設開場時段
 const DEFAULT_TIME_SLOTS = ['18:00-20:00', '20:00-22:00'];
 
-// 視圖切換：'setup' (開場設定) | 'board' (看板主畫面)
 const currentView = ref<'setup' | 'board'>('setup');
 
-// 今日活動開場設定
 const sessionConfig = ref<SessionConfig>({
   courtCount: 3,
   maxPlayersCount: 30,
@@ -61,26 +69,26 @@ const sessionConfig = ref<SessionConfig>({
   timeSlots: [...DEFAULT_TIME_SLOTS]
 });
 
-// 時段新增輸入框 (Setup 頁面)
 const newSlotInput = ref<string>('');
-
-// 看板時段篩選器：'all' 或特定的時段字串
 const currentSessionFilter = ref<string>('all');
 
-// 依據時間順序自動排序後的時段列表
 const sortedTimeSlots = computed(() => {
   return [...sessionConfig.value.timeSlots].sort((a, b) => parseTimeSlot(a) - parseTimeSlot(b));
 });
 
 const queuePlayers = ref<Player[]>([]);
+const matchHistories = ref<MatchHistoryRecord[]>([]); // 📊 全局對戰歷史紀錄
 const isLoading = ref<boolean>(false);
 const isDev = ref<boolean>(false);
 
-// 批次報名相關狀態 (Setup 頁面使用)
+// 用於即時計算等待時間的當前時間戳
+const currentTime = ref<number>(Date.now());
+
+// 批次報名相關狀態
 const batchText = ref<string>('');
 const batchDefaultGender = ref<string>('-');
 const batchDefaultLevel = ref<string>('5');
-const batchDefaultSessions = ref<string[]>([...DEFAULT_TIME_SLOTS]); // 預設帶入的時段
+const batchDefaultSessions = ref<string[]>([...DEFAULT_TIME_SLOTS]);
 
 // Modal 狀態
 const isEditModalOpen = ref<boolean>(false);
@@ -94,14 +102,16 @@ const newPlayer = ref<Omit<Player, 'id'>>({
   level: '5',
   status: '1',
   sessions: [],
-  partnerId: null
+  partnerId: null,
+  avoidIds: []
 });
 
-// 批次選擇狀態 (看板使用)
+// 📊 對戰紀錄 Modal 狀態
+const isHistoryModalOpen = ref<boolean>(false);
+
 const isBatchMode = ref<boolean>(false);
 const selectedPlayerIds = ref<(number | string)[]>([]);
 
-// 控制佇列分區收合
 const collapsedGroups = ref<Record<string, boolean>>({
   high: false, mid: false, low: false,
   fresh: false, moderate: false, veteran: false,
@@ -121,13 +131,41 @@ const isPlayerLimitReached = (player: Player): boolean => {
   return player.playedCount >= getPlayerMaxGames(player);
 };
 
-// 輔助函式：取得搭檔物件
 const getPartner = (player: Player): Player | undefined => {
   if (!player.partnerId) return undefined;
   return queuePlayers.value.find(p => String(p.id) === String(player.partnerId));
 };
 
-// --- 時段管理邏輯 (Setup 頁) ---
+// --- 等待時間格式化 ---
+const getWaitSeconds = (player: Player): number => {
+  if (!player.queueEnteredAt) return 0;
+  const diff = Math.floor((currentTime.value - player.queueEnteredAt) / 1000);
+  return diff > 0 ? diff : 0;
+};
+
+const formatWaitTime = (seconds: number): string => {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  if (mins >= 60) {
+    const hrs = Math.floor(mins / 60);
+    const remainMins = mins % 60;
+    return `${hrs}h${remainMins}m`;
+  }
+  return `${mins}分${String(secs).padStart(2, '0')}秒`;
+};
+
+// --- 計算某兩位球員過去對戰/同場過幾次 ---
+const getPairMatchCount = (nameA: string, nameB: string): number => {
+  let count = 0;
+  matchHistories.value.forEach(record => {
+    if (record.playerNames.includes(nameA) && record.playerNames.includes(nameB)) {
+      count++;
+    }
+  });
+  return count;
+};
+
+// --- 時段管理邏輯 ---
 const addTimeSlot = () => {
   const val = newSlotInput.value.trim();
   if (!val) return;
@@ -175,10 +213,11 @@ const initCourts = (count: number) => {
   courts.value = newCourts;
 };
 
-// --- 3. localStorage 本地快取操作 ---
+// --- localStorage 操作 ---
 const saveToLocalStorage = () => {
   localStorage.setItem(STORAGE_KEY_PLAYERS, JSON.stringify(queuePlayers.value));
   localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(sessionConfig.value));
+  localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(matchHistories.value));
 };
 
 const loadFromLocalStorage = () => {
@@ -199,14 +238,27 @@ const loadFromLocalStorage = () => {
     }
   }
 
+  const historyData = localStorage.getItem(STORAGE_KEY_HISTORY);
+  if (historyData) {
+    try {
+      matchHistories.value = JSON.parse(historyData);
+    } catch (e) {
+      console.error('解析 History 失敗:', e);
+    }
+  }
+
   const playerData = localStorage.getItem(STORAGE_KEY_PLAYERS);
+  const now = Date.now();
   if (playerData) {
     try {
       const parsedPlayers = JSON.parse(playerData);
       queuePlayers.value = parsedPlayers.map((p: any) => ({
         ...p,
         sessions: Array.isArray(p.sessions) ? p.sessions : (sessionConfig.value.timeSlots.slice(0, 1)),
-        partnerId: p.partnerId || null
+        partnerId: p.partnerId || null,
+        queueEnteredAt: p.queueEnteredAt || now,
+        lastMatchPeers: p.lastMatchPeers || [],
+        avoidIds: p.avoidIds || []
       }));
     } catch (e) {
       console.error('解析 Players 失敗:', e);
@@ -214,16 +266,15 @@ const loadFromLocalStorage = () => {
   } else {
     const defaultSlots = sessionConfig.value.timeSlots;
     queuePlayers.value = [
-      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1', sessions: [...defaultSlots], partnerId: null },
-      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: null },
-      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null },
-      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null }
+      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1', sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] }
     ];
   }
   initCourts(sessionConfig.value.courtCount);
 };
 
-// --- 4. 批次解析與匯入邏輯 (包含 🚺 判斷) ---
 const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, offsetIndex: number): boolean => {
   const cleanName = playerData.name.trim();
   if (!cleanName) return false;
@@ -233,7 +284,6 @@ const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, 
   if (existingPlayer) {
     const combinedSessions = Array.from(new Set([...existingPlayer.sessions, ...playerData.sessions]));
     existingPlayer.sessions = combinedSessions;
-
     if (playerData.gender !== '-' && existingPlayer.gender === '-') {
       existingPlayer.gender = playerData.gender;
     }
@@ -242,13 +292,15 @@ const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, 
     queuePlayers.value.push({
       id: nowTimestamp + offsetIndex,
       ...playerData,
-      name: cleanName
+      name: cleanName,
+      queueEnteredAt: nowTimestamp,
+      lastMatchPeers: [],
+      avoidIds: []
     });
     return true;
   }
 };
 
-// ⭐ 主要修改處：批次文字名單解析（含 🚺 / 🚹 判斷）
 const parseAndImportText = () => {
   if (!batchText.value.trim()) return alert('請先貼上選手名單！');
 
@@ -261,14 +313,12 @@ const parseAndImportText = () => {
     let cleanLine = line.trim();
     if (!cleanLine) return;
 
-    // 1. 移除開頭的數字編號（例如: "01.", "02. ", "03-", "04 "）
     cleanLine = cleanLine.replace(/^[\d]+[\.\)\-\s]+/, '').trim();
     if (!cleanLine) return;
 
     let gender = batchDefaultGender.value;
     let level = batchDefaultLevel.value;
 
-    // 2. 檢測並辨識 🚺 符號與性別關鍵字
     if (cleanLine.includes('🚺') || cleanLine.includes('♀')) {
       gender = 'F';
       cleanLine = cleanLine.replace(/🚺/g, '').replace(/♀/g, '').trim();
@@ -277,24 +327,19 @@ const parseAndImportText = () => {
       cleanLine = cleanLine.replace(/🚹/g, '').replace(/♂/g, '').trim();
     }
 
-    // 3. 以空格或逗號分割剩餘文字標籤
     const tokens = cleanLine.split(/[\s,，]+/).filter(Boolean);
     if (tokens.length === 0) return;
 
-    const name = tokens[0]; // 第一個 Token 當作姓名
+    const name = tokens[0];
     if (!name) return;
 
     let detectedSessions: string[] = [];
 
-    // 4. 解析等級、性別文字與時段
     tokens.slice(1).forEach(token => {
       const upper = token.toUpperCase();
-
-      // 文字性別判斷
       if (['M', '男', 'MALE'].includes(upper)) gender = 'M';
       else if (['F', '女', 'FEMALE'].includes(upper)) gender = 'F';
 
-      // 等級數字解析 (支援純數字如 8, 11 或 帶級字如 8級)
       const numMatch = token.match(/\d+/);
       if (numMatch) {
         const lvlNum = parseInt(numMatch[0], 10);
@@ -303,7 +348,6 @@ const parseAndImportText = () => {
         }
       }
 
-      // 時段匹配
       sessionConfig.value.timeSlots.forEach(slot => {
         if (token.includes(slot) || slot.includes(token)) {
           if (!detectedSessions.includes(slot)) detectedSessions.push(slot);
@@ -322,7 +366,8 @@ const parseAndImportText = () => {
       playedCount: 0,
       status: '1',
       sessions: finalSessions,
-      partnerId: null
+      partnerId: null,
+      avoidIds: []
     }, now, index);
 
     if (isNewItem) countAdded++;
@@ -389,7 +434,8 @@ const handleFileUpload = (event: Event) => {
         playedCount: 0,
         status: '1',
         sessions,
-        partnerId: null
+        partnerId: null,
+        avoidIds: []
       }, now, index);
 
       if (isNewItem) countAdded++;
@@ -415,7 +461,7 @@ const startSession = () => {
 
 const reopenSetup = () => { currentView.value = 'setup'; };
 
-// --- 5. 等待佇列排序與分區計算 ---
+// --- 5. 佇列排序與分區計算 ---
 const queueGroupMode = ref<'level' | 'playedCount' | 'resting'>('level');
 
 const toggleGroupMode = (mode: 'level' | 'playedCount' | 'resting') => {
@@ -520,6 +566,7 @@ const startGlobalTimer = () => {
   if (timerInterval.value) return;
   timerInterval.value = setInterval(() => {
     const now = Date.now();
+    currentTime.value = now; 
     courts.value.forEach(court => {
       if (court.status === 'playing' && court.startTime) {
         court.elapsedSeconds = Math.floor((now - court.startTime) / 1000);
@@ -576,6 +623,7 @@ const handlePlayerAddedToQueue = (evt: any) => {
   });
 
   if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
+    player.queueEnteredAt = Date.now(); 
     queuePlayers.value.push(player);
     saveToLocalStorage();
   }
@@ -594,7 +642,8 @@ const openAddModal = () => {
     level: '5', 
     status: '1',
     sessions: [...sessionConfig.value.timeSlots],
-    partnerId: null
+    partnerId: null,
+    avoidIds: []
   };
   isAddModalOpen.value = true;
 };
@@ -613,7 +662,8 @@ const saveNewPlayer = () => {
     sessions: newPlayer.value.sessions && newPlayer.value.sessions.length > 0 
       ? [...newPlayer.value.sessions] 
       : [...sessionConfig.value.timeSlots],
-    partnerId: null
+    partnerId: null,
+    avoidIds: []
   }, Date.now(), 0);
 
   saveToLocalStorage();
@@ -624,6 +674,9 @@ const openEditModal = (player: Player) => {
   editingPlayer.value = JSON.parse(JSON.stringify(player));
   if (!editingPlayer.value!.sessions) {
     editingPlayer.value!.sessions = [...sessionConfig.value.timeSlots];
+  }
+  if (!editingPlayer.value!.avoidIds) {
+    editingPlayer.value!.avoidIds = [];
   }
   isEditModalOpen.value = true;
 };
@@ -703,7 +756,10 @@ const toggleSelectAll = () => {
 const updateBatchStatus = (targetStatus: '0' | '1') => {
   if (selectedPlayerIds.value.length === 0) return;
   queuePlayers.value.forEach(p => {
-    if (selectedPlayerIds.value.includes(p.id)) p.status = targetStatus;
+    if (selectedPlayerIds.value.includes(p.id)) {
+      p.status = targetStatus;
+      if (targetStatus === '1') p.queueEnteredAt = Date.now();
+    }
   });
   saveToLocalStorage();
   selectedPlayerIds.value = [];
@@ -715,7 +771,10 @@ const batchResetPlayedCount = () => {
   if (!confirm(`確定要將選中的 ${selectedPlayerIds.value.length} 位選手已打場數歸零嗎？`)) return;
 
   queuePlayers.value.forEach(p => {
-    if (selectedPlayerIds.value.includes(p.id)) p.playedCount = 0;
+    if (selectedPlayerIds.value.includes(p.id)) {
+      p.playedCount = 0;
+      p.lastMatchPeers = []; // 🧹 場次歸零時，同步清除上局同場對象資訊
+    }
   });
   saveToLocalStorage();
   selectedPlayerIds.value = [];
@@ -753,8 +812,30 @@ const clearAllPlayersInSetup = () => {
   }
 };
 
+// --- 📊 清除對戰紀錄封裝函式 ---
+const clearMatchHistories = () => {
+  if (confirm('確定要清除所有對戰紀錄嗎？')) {
+    matchHistories.value = [];
+    saveToLocalStorage();
+  }
+};
+
 // --- 8. 自動配對與場地管理 ---
+const hasAvoidConflict = (courtPlayers: Player[], candidate: Player): boolean => {
+  const candidateAvoids = candidate.avoidIds || [];
+  for (const p of courtPlayers) {
+    if (candidateAvoids.includes(p.id) || (p.avoidIds && p.avoidIds.includes(candidate.id))) {
+      return true;
+    }
+    if (getPairMatchCount(candidate.name, p.name) >= 2) {
+      return true;
+    }
+  }
+  return false;
+};
+
 const isPreferredLevel = (courtPlayers: Player[], targetPlayer: Player): boolean => {
+  if (hasAvoidConflict(courtPlayers, targetPlayer)) return false; 
   if (courtPlayers.length === 0) return true;
   const targetLevel = Number(targetPlayer.level);
   if (isNaN(targetLevel)) return true;
@@ -765,12 +846,14 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
   const tryAddPlayerAndPartner = (candidate: Player, strictLevel: boolean): boolean => {
     if (court[targetZone].length >= 4) return false;
     if (strictLevel && !isPreferredLevel(court[targetZone], candidate)) return false;
+    if (!strictLevel && hasAvoidConflict(court[targetZone], candidate)) return false; 
 
     const partner = activeQueue.find(p => String(p.id) === String(candidate.partnerId));
 
     if (partner) {
       if (court[targetZone].length > 2) return false;
       if (strictLevel && !isPreferredLevel(court[targetZone], partner)) return false;
+      if (!strictLevel && hasAvoidConflict(court[targetZone], partner)) return false;
 
       court[targetZone].push(candidate, partner);
 
@@ -904,24 +987,42 @@ const startMatch = (court: Court) => {
   court.elapsedSeconds = 0;
 };
 
+// 🏁 結束比賽：原本在場上打完的人送回等待佇列，下局預備區的人遞補上場，並清空預備區
 const finishMatch = (courtId: number) => {
   const court = courts.value.find(c => c.id === courtId);
   if (!court) return;
 
-  court.players.forEach(p => p.playedCount += 1);
+  const playerNames = court.players.map(p => p.name);
+  
+  // 記錄對戰歷史
+  matchHistories.value.unshift({
+    id: 'm_' + Date.now() + '_' + court.id,
+    timestamp: Date.now(),
+    courtName: court.name,
+    playerNames: [...playerNames]
+  });
+
+  // 1. 將剛剛打完比賽的現正對局球員 playedCount + 1，並放回等待佇列
   court.players.forEach(p => {
+    p.playedCount += 1;
+    p.lastMatchPeers = playerNames.filter(name => name !== p.name);
+    p.queueEnteredAt = Date.now(); 
     if (!queuePlayers.value.some(existing => String(existing.id) === String(p.id))) {
       queuePlayers.value.push(p);
     }
   });
 
+  // 2. 將原本在「下局預備 (nextPlayers)」的球員遞補升格成為「現正對局 (players)」
   court.players = [...court.nextPlayers];
-  court.nextPlayers = [];
+  
+  // 3. 清空下局預備區
+  court.nextPlayers = []; 
+  
+  // 4. 重置場地狀態為準備中 (idle)
   court.status = 'idle';
   court.startTime = null;
   court.elapsedSeconds = 0;
 
-  fillCourtAuto(court);
   saveToLocalStorage();
 };
 
@@ -930,6 +1031,7 @@ const clearAllCourts = () => {
 
   courts.value.forEach(court => {
     court.players.concat(court.nextPlayers).forEach(p => {
+      p.queueEnteredAt = Date.now();
       if (!queuePlayers.value.some(q => String(q.id) === String(p.id))) {
         queuePlayers.value.push(p);
       }
@@ -1001,7 +1103,7 @@ const getGenderText = (gender: string) => {
                 <input id="setupMaxGames" type="number" min="1" max="20" v-model.number="sessionConfig.maxGamesPerPlayer" class="setup-input" />
                 <span>場/時段</span>
               </div>
-              <small class="hint-text">💡 報名 2 個時段的選手，總上限將自動倍增（如 4 場 ➔ 8 場）。</small>
+              <small class="hint-text">💡 報名 2 個時段的選手，總上限將自動倍增。</small>
             </div>
 
             <div class="form-item">
@@ -1031,7 +1133,7 @@ const getGenderText = (gender: string) => {
         <div class="setup-card">
           <div class="setup-header">
             <h2>📋 2. 選手批次報名</h2>
-            <p>可直接複製 LINE 名單貼上，或讀取 CSV 檔案 (支援 🚺/🚹 性別與等級)</p>
+            <p>可直接複製 LINE 名單貼上，或讀取 CSV 檔案</p>
           </div>
 
           <div class="batch-defaults">
@@ -1062,7 +1164,7 @@ const getGenderText = (gender: string) => {
           </div>
 
           <div class="form-item" style="margin-top: 10px;">
-            <label>快速貼上名單（支援 🚺/🚹 符號、等級、編號）：</label>
+            <label>快速貼上名單：</label>
             <textarea 
               v-model="batchText" 
               rows="6" 
@@ -1070,10 +1172,7 @@ const getGenderText = (gender: string) => {
               placeholder="範例格式：
 01.威力 11
 02.阿布 13
-03.Romy 8 🚺
-04.球球 7🚺
-05.胖吉 9
-07. 慈慈 7🚺"
+03.Romy 8 🚺"
             ></textarea>
             <button class="btn-import-text" @click="parseAndImportText">📥 批次匯入文字名單</button>
           </div>
@@ -1083,7 +1182,6 @@ const getGenderText = (gender: string) => {
           <div class="form-item">
             <label>或 上傳 CSV 檔案匯入：</label>
             <input type="file" accept=".csv" @change="handleFileUpload" class="file-input" />
-            <small class="tip">CSV 欄位順序：姓名, 性別(M/F/🚺), 等級(1-15), 時段(用 / 分隔)</small>
           </div>
         </div>
 
@@ -1101,7 +1199,6 @@ const getGenderText = (gender: string) => {
               <span class="p-name">{{ p.name }}</span>
               <span class="p-level">{{ p.level }}級</span>
               <span class="p-partner" v-if="getPartner(p)">🔗 {{ getPartner(p)?.name }}</span>
-              <span class="p-sessions" v-if="p.sessions && p.sessions.length">[{{ p.sessions.join(', ') }}]</span>
               <button class="btn-remove-tag" @click="removeSinglePlayerInSetup(p.id)">✕</button>
             </div>
           </div>
@@ -1134,6 +1231,7 @@ const getGenderText = (gender: string) => {
             <button class="btn-setup-reconfig" @click="reopenSetup">⚙️ 調整開場設定</button>
             <button class="btn-add-player" @click="openAddModal">➕ 選手報名</button>
             <button class="btn-auto-assign" @click="autoAssignAllCourts">⚡ 一鍵自動排點</button>
+            <button class="btn-history-modal" @click="isHistoryModalOpen = true">📊 對戰紀錄 ({{ matchHistories.length }})</button>
             <button class="btn-clear-courts" @click="clearAllCourts" :disabled="isLoading">🗑 清空場地</button>
 
             <div class="court-selector">
@@ -1261,7 +1359,7 @@ const getGenderText = (gender: string) => {
                 <button class="btn-batch-delete" :disabled="selectedPlayerIds.length === 0" @click="batchDeletePlayers">🗑️ 刪除</button>
               </div>
             </div>
-            <span v-else class="header-tip">💡 點擊選手卡片即可編輯資料或綁定搭檔</span>
+            <span v-else class="header-tip">💡 點擊選手卡片可查看等待時間、上局夥伴或設定錯開名單</span>
           </div>
 
           <div class="queue-container">
@@ -1297,22 +1395,31 @@ const getGenderText = (gender: string) => {
                            @click.stop="toggleSelectPlayer(player)" />
                   </div>
 
-                  <div class="player-info">
-                    <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
-                    <span class="player-name">{{ player.name }}</span>
-                    <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
-                    <span v-if="String(player.status) === '0'" class="resting-badge">💤 休息</span>
-                    <span v-else-if="isPlayerLimitReached(player)" class="completed-badge">🏁 完賽</span>
-                    <span class="session-badge" v-if="player.sessions && player.sessions.length > 0">
-                      {{ player.sessions.length === sessionConfig.timeSlots.length ? '全時段' : player.sessions.join(',') }}
-                    </span>
+                  <div class="player-info-container">
+                    <div class="player-info">
+                      <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
+                      <span class="player-name">{{ player.name }}</span>
+                      <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+                      <span v-if="String(player.status) === '0'" class="resting-badge">💤 休息</span>
+                      <span v-else-if="isPlayerLimitReached(player)" class="completed-badge">🏁 完賽</span>
+                    </div>
+
+                    <!-- ⏳ 顯示等待時間與上局夥伴資訊 -->
+                    <div class="player-extra-meta">
+                      <span class="wait-time-badge" :class="{ 'warning-wait': getWaitSeconds(player) > 900 }">
+                        ⏳ 等待: {{ formatWaitTime(getWaitSeconds(player)) }}
+                      </span>
+                      <span v-if="player.lastMatchPeers && player.lastMatchPeers.length > 0" class="last-peers-badge" :title="'上局同場: ' + player.lastMatchPeers.join(', ')">
+                        👥 上局: {{ player.lastMatchPeers.join(', ') }}
+                      </span>
+                    </div>
                   </div>
 
                   <div class="player-actions-right">
                     <div class="player-stats">
                       <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
                       <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
-                        已打: {{ player.playedCount }}/{{ getPlayerMaxGames(player) }}場
+                        {{ player.playedCount }}/{{ getPlayerMaxGames(player) }}
                       </span>
                     </div>
                     <button v-if="!isBatchMode && String(player.status) !== '0' && !isPlayerLimitReached(player)" class="btn-quick-add" title="快速排入" @click.stop="addPlayerToAvailableCourt(player)">➕</button>
@@ -1350,15 +1457,6 @@ const getGenderText = (gender: string) => {
                 <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
               </select>
             </div>
-            <div class="form-group">
-              <label>報名時段 (可複選)：</label>
-              <div class="checkbox-group">
-                <label v-for="slot in sessionConfig.timeSlots" :key="slot" class="checkbox-item">
-                  <input type="checkbox" :value="slot" v-model="newPlayer.sessions" />
-                  <span>{{ slot }}</span>
-                </label>
-              </div>
-            </div>
           </div>
           <div class="modal-footer">
             <button class="btn-cancel" @click="closeAddModal">取消</button>
@@ -1367,11 +1465,11 @@ const getGenderText = (gender: string) => {
         </div>
       </div>
 
-      <!-- Modal: 編輯選手 -->
+      <!-- Modal: 編輯選手 (含錯開設定與搭檔綁定) -->
       <div v-if="isEditModalOpen && editingPlayer" class="modal-overlay" @click.self="closeEditModal">
         <div class="modal-card">
           <div class="modal-header">
-            <h3>✏️ 編輯選手資料</h3>
+            <h3>✏️ 編輯選手資料 ({{ editingPlayer.name }})</h3>
             <button class="btn-close" @click="closeEditModal">✕</button>
           </div>
           <div class="modal-body">
@@ -1388,18 +1486,29 @@ const getGenderText = (gender: string) => {
                   v-for="p in queuePlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" 
                   :key="p.id" 
                   :value="p.id">
-                  {{ p.name }} ({{ p.level }}級{{ p.partnerId && String(p.partnerId) !== String(editingPlayer?.id) ? ' - 已有搭檔' : '' }})
+                  {{ p.name }} ({{ p.level }}級)
                 </option>
               </select>
-              <small class="hint-text">💡 設定綁定後，自動排點或點擊排入時會盡量將兩人安排在同一場。</small>
+            </div>
+
+            <!-- ⛔ 避開特定球員設定 -->
+            <div class="form-group">
+              <label>⛔ 避開特定球員 (不同場，可多選)：</label>
+              <div class="checkbox-group avoid-checkboxes">
+                <label v-for="p in queuePlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" :key="p.id" class="checkbox-item">
+                  <input type="checkbox" :value="p.id" v-model="editingPlayer.avoidIds" />
+                  <span>{{ p.name }} ({{ p.level }}級)</span>
+                </label>
+              </div>
+              <small class="hint-text">💡 勾選後，系統在自動排點或快速加入時，絕不會將兩人排在同一場（註：同場達 2 次以上也會自動避開）。</small>
             </div>
 
             <div class="form-group">
               <label>性別：</label>
               <select v-model="editingPlayer.gender" class="form-select">
                 <option value="-">⚪ 無 / 不指定</option>
-                <option value="M">♂ 男 (Male)</option>
-                <option value="F">♀ 女 (Female)</option>
+                <option value="M">♂ 男</option>
+                <option value="F">♀ 女</option>
               </select>
             </div>
             <div class="form-group">
@@ -1419,19 +1528,38 @@ const getGenderText = (gender: string) => {
                 <option value="0">🔴 休息請假中</option>
               </select>
             </div>
-            <div class="form-group">
-              <label>報名時段 (可複選)：</label>
-              <div class="checkbox-group">
-                <label v-for="slot in sessionConfig.timeSlots" :key="slot" class="checkbox-item">
-                  <input type="checkbox" :value="slot" v-model="editingPlayer.sessions" />
-                  <span>{{ slot }}</span>
-                </label>
-              </div>
-            </div>
           </div>
           <div class="modal-footer">
             <button class="btn-cancel" @click="closeEditModal">取消</button>
             <button class="btn-save" @click="savePlayerEdit">儲存變更</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal: 對戰紀錄查詢 -->
+      <div v-if="isHistoryModalOpen" class="modal-overlay" @click.self="isHistoryModalOpen = false">
+        <div class="modal-card history-modal-card">
+          <div class="modal-header">
+            <h3>📊 全局對戰紀錄 (共 {{ matchHistories.length }} 場)</h3>
+            <button class="btn-close" @click="isHistoryModalOpen = false">✕</button>
+          </div>
+          <div class="modal-body history-modal-body">
+            <div v-if="matchHistories.length === 0" class="empty-tip">目前尚無任何已結束的比賽紀錄。</div>
+            <div v-else class="history-list">
+              <div v-for="record in matchHistories" :key="record.id" class="history-item">
+                <div class="history-item-top">
+                  <span class="h-court">{{ record.courtName }}</span>
+                  <span class="h-time">{{ new Date(record.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
+                </div>
+                <div class="h-players">
+                  <span class="h-player-tag" v-for="name in record.playerNames" :key="name">{{ name }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-cancel" @click="isHistoryModalOpen = false">關閉</button>
+            <button class="btn-save btn-danger-sub" @click="clearMatchHistories">清空紀錄</button>
           </div>
         </div>
       </div>
@@ -1444,947 +1572,199 @@ const getGenderText = (gender: string) => {
   min-height: 100vh;
   min-height: 100dvh;
   background-color: #f8fafc;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   color: #334155;
   box-sizing: border-box;
-  -webkit-tap-highlight-color: transparent;
 }
 
 .touch-action-none { touch-action: none; }
 .clickable { cursor: pointer; }
 
-.setup-container {
-  display: flex;
-  justify-content: center;
-  padding: 24px 20px;
-  max-width: 1440px;
-  margin: 0 auto;
-  box-sizing: border-box;
-}
+.setup-container { display: flex; justify-content: center; padding: 24px 20px; max-width: 1440px; margin: 0 auto; }
+.setup-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; width: 100%; }
+.setup-card { background: #ffffff; border-radius: 12px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05); padding: 20px; display: flex; flex-direction: column; border: 1px solid #e2e8f0; }
 
-.setup-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 20px;
-  width: 100%;
-}
+.preview-card { display: flex; flex-direction: column; max-height: calc(100vh - 80px); }
+.setup-header h2, .setup-header h3 { font-size: 1.15rem; color: #1e293b; margin: 0 0 4px 0; }
+.setup-header p { color: #64748b; font-size: 0.825rem; margin: 0; }
 
-.setup-card {
-  background: #ffffff;
-  border-radius: 12px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  border: 1px solid #e2e8f0;
-}
+.setup-form { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; }
+.form-item { display: flex; flex-direction: column; gap: 6px; }
+.form-item label { font-weight: 600; color: #334155; font-size: 0.85rem; }
+.slot-label-row { display: flex; justify-content: space-between; align-items: center; }
+.btn-reset-slots { background: none; border: none; color: #2563eb; font-size: 0.75rem; cursor: pointer; text-decoration: underline; }
+.input-with-unit { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; color: #64748b; }
+.setup-input { flex: 1; padding: 8px 12px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.9rem; outline: none; }
+.setup-actions { margin-top: 16px; padding-top: 12px; }
+.btn-start-session { width: 100%; padding: 12px; background-color: #2563eb; color: #ffffff; font-size: 0.95rem; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; }
 
-.preview-card {
-  display: flex;
-  flex-direction: column;
-  max-height: calc(100vh - 80px);
-}
-
-.setup-header h2, .setup-header h3 {
-  font-size: 1.15rem;
-  color: #1e293b;
-  margin: 0 0 4px 0;
-}
-
-.setup-header p {
-  color: #64748b;
-  font-size: 0.825rem;
-  margin: 0;
-}
-
-.setup-form {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  margin-top: 12px;
-}
-
-.form-item {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.form-item label {
-  font-weight: 600;
-  color: #334155;
-  font-size: 0.85rem;
-}
-
-.slot-label-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.btn-reset-slots {
-  background: none;
-  border: none;
-  color: #2563eb;
-  font-size: 0.75rem;
-  cursor: pointer;
-  padding: 0;
-  text-decoration: underline;
-}
-
-.input-with-unit {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 0.85rem;
-  color: #64748b;
-}
-
-.setup-input {
-  flex: 1;
-  padding: 8px 12px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  font-size: 0.9rem;
-  outline: none;
-  transition: border-color 0.2s;
-}
-
-.setup-input:focus { border-color: #2563eb; }
-
-.setup-actions {
-  margin-top: 16px;
-  padding-top: 12px;
-}
-
-.btn-start-session {
-  width: 100%;
-  padding: 12px;
-  background-color: #2563eb;
-  color: #ffffff;
-  font-size: 0.95rem;
-  font-weight: 600;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: background-color 0.2s;
-}
-
-.btn-start-session:hover { background-color: #1d4ed8; }
-
-.slots-editor {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 4px;
-}
-
-.slot-tag {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  background-color: #e0f2fe;
-  color: #0369a1;
-  padding: 4px 10px;
-  border-radius: 12px;
-  font-size: 0.8rem;
-  font-weight: 600;
-}
-
-.btn-remove-slot {
-  border: none;
-  background: transparent;
-  color: #0284c7;
-  cursor: pointer;
-  font-size: 0.85rem;
-  padding: 0 2px;
-}
-
+.slots-editor { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.slot-tag { display: flex; align-items: center; gap: 4px; background-color: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 600; }
+.btn-remove-slot { border: none; background: transparent; color: #0284c7; cursor: pointer; font-size: 0.85rem; }
 .add-slot-row { display: flex; gap: 8px; }
 .small-input { max-width: 160px; }
+.btn-add-slot { padding: 6px 12px; background-color: #0284c7; color: white; border: none; border-radius: 6px; font-size: 0.8rem; cursor: pointer; }
 
-.btn-add-slot {
-  padding: 6px 12px;
-  background-color: #0284c7;
-  color: white;
-  border: none;
-  border-radius: 6px;
-  font-size: 0.8rem;
-  cursor: pointer;
-}
+.batch-defaults { display: flex; gap: 16px; background-color: #f8fafc; padding: 8px 12px; border-radius: 6px; margin: 12px 0; border: 1px solid #e2e8f0; flex-wrap: wrap; }
+.default-item { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: #475569; }
+.small-select { padding: 4px 8px; border-radius: 4px; border: 1px solid #cbd5e1; background-color: #fff; font-size: 0.8rem; }
+.session-label { font-size: 0.8rem; font-weight: 600; color: #475569; }
+.checkbox-group { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.checkbox-item { display: flex; align-items: center; gap: 4px; font-size: 0.8rem; color: #334155; cursor: pointer; }
 
-.batch-defaults {
-  display: flex;
-  gap: 16px;
-  background-color: #f8fafc;
-  padding: 8px 12px;
-  border-radius: 6px;
-  margin: 12px 0;
-  border: 1px solid #e2e8f0;
-  flex-wrap: wrap;
-}
+.batch-textarea { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; resize: vertical; outline: none; box-sizing: border-box; }
+.btn-import-text { margin-top: 8px; padding: 8px 14px; background-color: #059669; color: #ffffff; border: none; border-radius: 6px; font-weight: 600; font-size: 0.85rem; cursor: pointer; }
 
-.default-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.8rem;
-  color: #475569;
-}
+.divider { border: none; border-top: 1px dashed #e2e8f0; margin: 14px 0; }
+.preview-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.btn-clear-all { background-color: #ef4444; color: white; border: none; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
+.empty-tip { font-size: 0.85rem; color: #94a3b8; padding: 12px 0; }
+.preview-player-tags { display: flex; flex-direction: column; gap: 8px; flex: 1; overflow-y: auto; padding: 8px; background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 520px; }
+.preview-tag { display: flex; align-items: center; justify-content: space-between; background-color: #ffffff; border: 1px solid #cbd5e1; padding: 6px 10px; border-radius: 8px; font-size: 0.825rem; }
 
-.small-select {
-  padding: 4px 8px;
-  border-radius: 4px;
-  border: 1px solid #cbd5e1;
-  background-color: #fff;
-  font-size: 0.8rem;
-}
-
-.session-label {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: #475569;
-}
-
-.checkbox-group {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 6px;
-}
-
-.checkbox-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 0.8rem;
-  color: #334155;
-  cursor: pointer;
-}
-
-.batch-textarea {
-  width: 100%;
-  padding: 10px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  font-family: inherit;
-  font-size: 0.85rem;
-  resize: vertical;
-  box-sizing: border-box;
-  outline: none;
-}
-
-.btn-import-text {
-  margin-top: 8px;
-  padding: 8px 14px;
-  background-color: #059669;
-  color: #ffffff;
-  border: none;
-  border-radius: 6px;
-  font-weight: 600;
-  font-size: 0.85rem;
-  cursor: pointer;
-}
-
-.divider {
-  border: none;
-  border-top: 1px dashed #e2e8f0;
-  margin: 14px 0;
-}
-
-.preview-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-}
-
-.btn-clear-all {
-  background-color: #ef4444;
-  color: white;
-  border: none;
-  padding: 4px 10px;
-  border-radius: 4px;
-  font-size: 0.8rem;
-  cursor: pointer;
-}
-
-.empty-tip {
-  font-size: 0.85rem;
-  color: #94a3b8;
-  padding: 12px 0;
-}
-
-.preview-player-tags {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  flex: 1;
-  overflow-y: auto;
-  padding: 8px;
-  background-color: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  margin-top: 8px;
-  max-height: 520px;
-}
-
-.preview-tag {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background-color: #ffffff;
-  border: 1px solid #cbd5e1;
-  padding: 6px 10px;
-  border-radius: 8px;
-  font-size: 0.825rem;
-}
-
-.p-gender { font-weight: bold; }
-.p-gender.male { color: #2563eb; }
-.p-gender.female { color: #ec4899; }
+.p-gender.male { color: #2563eb; font-weight: bold; }
+.p-gender.female { color: #ec4899; font-weight: bold; }
 .p-name { font-weight: 600; flex: 1; margin: 0 6px; color: #1e293b; }
 .p-level { color: #475569; font-size: 0.75rem; background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+.p-partner { font-size: 0.72rem; background-color: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 4px; margin-left: 4px; }
+.btn-remove-tag { border: none; background: transparent; color: #94a3b8; cursor: pointer; font-weight: bold; }
 
-.p-partner {
-  font-size: 0.72rem;
-  background-color: #fef3c7;
-  color: #92400e;
-  padding: 1px 6px;
-  border-radius: 4px;
-  margin-left: 4px;
-}
-
-.p-sessions {
-  font-size: 0.72rem;
-  color: #0284c7;
-  margin-left: 4px;
-}
-
-.btn-remove-tag {
-  border: none;
-  background: transparent;
-  color: #94a3b8;
-  cursor: pointer;
-  font-weight: bold;
-  padding: 0 4px;
-}
-
-.btn-remove-tag:hover { color: #ef4444; }
-
-.app-header {
-  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-  color: #ffffff;
-  padding: 12px 16px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
-  position: sticky;
-  top: 0;
-  z-index: 100;
-}
-
-.header-content {
-  max-width: 1600px;
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.header-top-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.app-title {
-  font-size: 1.2rem;
-  margin: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  flex-wrap: wrap;
-}
-
-.mode-badge {
-  font-size: 0.7rem;
-  padding: 2px 8px;
-  border-radius: 12px;
-  font-weight: 500;
-}
-
+.app-header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #ffffff; padding: 12px 16px; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); }
+.header-content { max-width: 1600px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+.header-top-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
+.app-title { font-size: 1.2rem; margin: 0; display: flex; align-items: center; gap: 8px; font-weight: 700; flex-wrap: wrap; }
+.mode-badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 12px; font-weight: 500; }
 .mode-badge.dev { background-color: #f59e0b; color: #fff; }
 .mode-badge.prod { background-color: #10b981; color: #fff; }
 
-.session-filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
+.session-filter-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .filter-label { font-size: 0.8rem; color: #94a3b8; }
+.btn-session-filter { background: rgba(255, 255, 255, 0.08); color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.15); padding: 4px 12px; border-radius: 20px; font-size: 0.78rem; cursor: pointer; }
+.btn-session-filter.active { background: #2563eb; color: #ffffff; border-color: #3b82f6; font-weight: 600; }
 
-.btn-session-filter {
-  background: rgba(255, 255, 255, 0.08);
-  color: #cbd5e1;
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  padding: 4px 12px;
-  border-radius: 20px;
-  font-size: 0.78rem;
-  cursor: pointer;
-  transition: all 0.2s ease;
-}
-
-.btn-session-filter:hover { background: rgba(255, 255, 255, 0.18); color: #fff; }
-
-.btn-session-filter.active {
-  background: #2563eb;
-  color: #ffffff;
-  border-color: #3b82f6;
-  font-weight: 600;
-  box-shadow: 0 0 10px rgba(37, 99, 235, 0.4);
-}
-
-.header-controls {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.header-controls button {
-  padding: 6px 12px;
-  border-radius: 8px;
-  font-size: 0.8rem;
-  font-weight: 600;
-  border: none;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  min-height: 34px;
-}
-
-.header-controls button:hover:not(:disabled) { filter: brightness(1.08); }
-
+.header-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.header-controls button { padding: 6px 12px; border-radius: 8px; font-size: 0.8rem; font-weight: 600; border: none; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; min-height: 34px; }
 .btn-setup-reconfig { background-color: #334155; color: #f8fafc; }
 .btn-add-player { background-color: #059669; color: white; }
 .btn-auto-assign { background-color: #d97706; color: white; }
+.btn-history-modal { background-color: #7c3aed; color: white; }
 .btn-clear-courts { background-color: #dc2626; color: white; }
 
-.court-selector {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.8rem;
-  color: #cbd5e1;
-  background: rgba(255, 255, 255, 0.06);
-  padding: 4px 8px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  min-height: 34px;
-  box-sizing: border-box;
-}
+.court-selector { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: #cbd5e1; background: rgba(255, 255, 255, 0.06); padding: 4px 8px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.1); min-height: 34px; box-sizing: border-box; }
+.court-selector select { padding: 2px 6px; border-radius: 6px; border: 1px solid #475569; background-color: #0f172a; color: white; font-weight: 600; outline: none; }
 
-.court-selector select {
-  padding: 2px 6px;
-  border-radius: 6px;
-  border: 1px solid #475569;
-  background-color: #0f172a;
-  color: white;
-  outline: none;
-  font-weight: 600;
-}
+.app-content-wrapper { max-width: 1600px; margin: 12px auto 0 auto; padding: 0 12px 12px 12px; display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; box-sizing: border-box; }
+.courts-section { display: flex; flex-direction: column; width: 100%; min-width: 0; max-height: calc(100vh - 120px); overflow-y: auto; padding-right: 4px; }
+.queue-section { background: #ffffff; border-radius: 14px; padding: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03); border: 1px solid #e2e8f0; display: flex; flex-direction: column; gap: 10px; max-height: calc(100vh - 120px); position: sticky; top: 80px; overflow-y: auto; box-sizing: border-box; }
 
-.app-content-wrapper {
-  max-width: 1600px;
-  margin: 12px auto 0 auto;
-  padding: 0 12px 12px 12px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 16px;
-  align-items: start;
-  box-sizing: border-box;
-}
-
-.courts-section {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  min-width: 0;
-  max-height: calc(100vh - 120px);
-  max-height: calc(100dvh - 120px);
-  overflow-y: auto;
-  padding-right: 4px;
-}
-
-.queue-section {
-  background: #ffffff;
-  border-radius: 14px;
-  padding: 12px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
-  border: 1px solid #e2e8f0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  box-sizing: border-box;
-  max-height: calc(100vh - 120px);
-  max-height: calc(100dvh - 120px);
-  position: sticky;
-  top: 80px;
-  overflow-y: auto;
-}
-
-.section-header {
-  margin-bottom: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.section-header h2 {
-  font-size: 1.05rem;
-  margin: 0;
-  color: #0f172a;
-  font-weight: 700;
-}
-
-.header-title-group {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
+.section-header { margin-bottom: 6px; display: flex; flex-direction: column; gap: 6px; }
+.section-header h2 { font-size: 1.05rem; margin: 0; color: #0f172a; font-weight: 700; }
+.header-title-group { display: flex; justify-content: space-between; align-items: center; }
 .header-tip { font-size: 0.725rem; color: #64748b; }
 
-.courts-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-  gap: 12px;
-  align-items: stretch;
-}
-
-.court-card {
-  background: #ffffff;
-  border-radius: 12px;
-  border: 1px solid #e2e8f0;
-  padding: 12px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.court-card.playing {
-  border-color: #3b82f6;
-  box-shadow: 0 6px 16px rgba(59, 130, 246, 0.12);
-}
-
-.court-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  border-bottom: 1px solid #f1f5f9;
-  padding-bottom: 6px;
-}
-
+.courts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.court-card { background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0; padding: 12px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03); display: flex; flex-direction: column; gap: 8px; }
+.court-card.playing { border-color: #3b82f6; box-shadow: 0 6px 16px rgba(59, 130, 246, 0.12); }
+.court-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
 .title-with-status { display: flex; align-items: center; gap: 6px; }
-
-.court-header h3 {
-  margin: 0;
-  font-size: 1rem;
-  color: #0f172a;
-  font-weight: 700;
-}
-
-.court-header-right { display: flex; align-items: center; gap: 6px; }
-
-.match-timer {
-  font-size: 0.75rem;
-  font-weight: 700;
-  color: #1d4ed8;
-  background-color: #eff6ff;
-  padding: 2px 6px;
-  border-radius: 6px;
-  border: 1px solid #bfdbfe;
-}
-
-.player-count {
-  font-size: 0.725rem;
-  color: #64748b;
-  background-color: #f1f5f9;
-  padding: 2px 6px;
-  border-radius: 6px;
-  font-weight: 600;
-}
-
+.court-header h3 { margin: 0; font-size: 1rem; color: #0f172a; font-weight: 700; }
+.match-timer { font-size: 0.75rem; font-weight: 700; color: #1d4ed8; background-color: #eff6ff; padding: 2px 6px; border-radius: 6px; border: 1px solid #bfdbfe; }
+.player-count { font-size: 0.725rem; color: #64748b; background-color: #f1f5f9; padding: 2px 6px; border-radius: 6px; font-weight: 600; }
 .player-count.full { background-color: #dcfce7; color: #15803d; }
-
-.status-badge {
-  font-size: 0.7rem;
-  padding: 2px 6px;
-  border-radius: 6px;
-  background: #f1f5f9;
-  color: #64748b;
-  font-weight: 600;
-}
-
+.status-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 6px; background: #f1f5f9; color: #64748b; font-weight: 600; }
 .status-badge.playing { background: #dbeafe; color: #1d4ed8; }
 
-.zone-label {
-  font-size: 0.7rem;
-  font-weight: 700;
-  color: #475569;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
+.zone-label { font-size: 0.7rem; font-weight: 700; color: #475569; display: flex; align-items: center; gap: 4px; }
 .next-zone-label { margin-top: 2px; color: #64748b; }
 
-.player-list {
-  min-height: 70px;
-  background-color: #f8fafc;
-  border: 1.5px dashed #cbd5e1;
-  border-radius: 8px;
-  padding: 5px;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.player-card {
-  background: #ffffff;
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 6px 8px;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
-  cursor: grab;
-  user-select: none;
-}
-
+.player-list { min-height: 70px; background-color: #f8fafc; border: 1.5px dashed #cbd5e1; border-radius: 8px; padding: 5px; display: flex; flex-direction: column; gap: 5px; }
+.player-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px 8px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03); cursor: grab; user-select: none; }
 .player-card.is-next-up { background-color: #fdfdfd; border-style: dashed; }
+.player-card.is-selected { border-color: #2563eb; background-color: #eff6ff; }
+.player-card.is-resting { opacity: 0.85; background-color: #fffbeb; border-left: 3px solid #f59e0b; }
+.player-card.is-completed { opacity: 0.75; background-color: #f8fafc; border-left: 3px solid #ef4444; }
 
-.player-info {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 0.825rem;
-  font-weight: 600;
-  flex-wrap: wrap;
-}
-
+.player-info-container { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+.player-info { display: flex; align-items: center; gap: 5px; font-size: 0.825rem; font-weight: 600; flex-wrap: wrap; }
 .player-gender.male { color: #2563eb; }
 .player-gender.female { color: #ec4899; }
 .player-name { color: #1e293b; }
 
-.partner-badge {
-  font-size: 0.65rem;
-  background-color: #fef3c7;
-  color: #92400e;
-  padding: 1px 4px;
-  border-radius: 4px;
-  font-weight: 500;
-}
+.player-extra-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wait-time-badge { font-size: 0.65rem; background-color: #f1f5f9; color: #475569; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
+.wait-time-badge.warning-wait { background-color: #fee2e2; color: #dc2626; }
+.last-peers-badge { font-size: 0.65rem; background-color: #f3e8ff; color: #7e22ce; padding: 1px 5px; border-radius: 4px; }
 
-.session-badge {
-  font-size: 0.65rem;
-  background-color: #e0f2fe;
-  color: #0369a1;
-  padding: 1px 4px;
-  border-radius: 4px;
-}
-
-.resting-badge {
-  font-size: 0.65rem;
-  background-color: #fef3c7;
-  color: #b45309;
-  padding: 1px 4px;
-  border-radius: 4px;
-}
-
-.completed-badge {
-  background-color: #fee2e2;
-  color: #dc2626;
-  font-size: 0.65rem;
-  padding: 1px 4px;
-  border-radius: 4px;
-  font-weight: 600;
-}
-
-.player-card.is-completed {
-  opacity: 0.75;
-  background-color: #f8fafc;
-  border-left: 3px solid #ef4444;
-}
-
-.player-card.is-resting {
-  opacity: 0.85;
-  background-color: #fffbeb;
-  border-left: 3px solid #f59e0b;
-}
-
-.player-card.is-selected {
-  border-color: #2563eb;
-  background-color: #eff6ff;
-}
+.partner-badge { font-size: 0.65rem; background-color: #fef3c7; color: #92400e; padding: 1px 4px; border-radius: 4px; }
+.resting-badge { font-size: 0.65rem; background-color: #fef3c7; color: #b45309; padding: 1px 4px; border-radius: 4px; }
+.completed-badge { background-color: #fee2e2; color: #dc2626; font-size: 0.65rem; padding: 1px 4px; border-radius: 4px; font-weight: 600; }
 
 .player-stats { display: flex; align-items: center; gap: 4px; }
-
-.level-tag {
-  background-color: #f1f5f9;
-  color: #334155;
-  font-size: 0.7rem;
-  padding: 1px 4px;
-  border-radius: 4px;
-  font-weight: 700;
-}
-
-.played-tag {
-  font-size: 0.68rem;
-  color: #64748b;
-  background: #f1f5f9;
-  padding: 1px 4px;
-  border-radius: 4px;
-}
-
-.played-tag.limit-reached {
-  background-color: #ef4444;
-  color: #ffffff;
-  font-weight: bold;
-}
+.level-tag { background-color: #f1f5f9; color: #334155; font-size: 0.7rem; padding: 1px 4px; border-radius: 4px; font-weight: 700; }
+.played-tag { font-size: 0.68rem; color: #64748b; background: #f1f5f9; padding: 1px 4px; border-radius: 4px; }
+.played-tag.limit-reached { background-color: #ef4444; color: #ffffff; font-weight: bold; }
 
 .player-actions-right { display: flex; align-items: center; gap: 4px; }
-
-.btn-quick-add {
-  background: #dbeafe;
-  color: #1d4ed8;
-  border: none;
-  border-radius: 4px;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.8rem;
-  cursor: pointer;
-  padding: 0;
-}
+.btn-quick-add { background: #dbeafe; color: #1d4ed8; border: none; border-radius: 4px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; cursor: pointer; padding: 0; }
 
 .court-actions { margin-top: auto; padding-top: 2px; }
-
-.btn-start-match, .btn-finish-match {
-  width: 100%;
-  padding: 8px;
-  border-radius: 6px;
-  border: none;
-  font-weight: 700;
-  font-size: 0.825rem;
-  cursor: pointer;
-}
-
+.btn-start-match, .btn-finish-match { width: 100%; padding: 8px; border-radius: 6px; border: none; font-weight: 700; font-size: 0.825rem; cursor: pointer; }
 .btn-start-match { background-color: #16a34a; color: white; }
 .btn-finish-match { background-color: #dc2626; color: white; }
 
-.btn-toggle-batch {
-  padding: 3px 6px;
-  font-size: 0.725rem;
-  border: 1px solid #cbd5e1;
-  background: #f8fafc;
-  color: #475569;
-  border-radius: 4px;
-  cursor: pointer;
-  font-weight: 600;
-}
+.btn-toggle-batch { padding: 3px 6px; font-size: 0.725rem; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; border-radius: 4px; cursor: pointer; font-weight: 600; }
+.btn-toggle-batch.active { background-color: #2563eb; color: #ffffff; border-color: #2563eb; }
 
-.btn-toggle-batch.active {
-  background-color: #2563eb;
-  color: #ffffff;
-  border-color: #2563eb;
-}
-
-.group-mode-switch {
-  display: flex;
-  gap: 4px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
+.group-mode-switch { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
 .switch-label { font-size: 0.75rem; color: #64748b; }
+.btn-mode-tab { padding: 2px 6px; font-size: 0.725rem; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; border-radius: 4px; cursor: pointer; }
+.btn-mode-tab.active { background: #0f172a; color: white; border-color: #0f172a; }
 
-.btn-mode-tab {
-  padding: 2px 6px;
-  font-size: 0.725rem;
-  border: 1px solid #cbd5e1;
-  background: #f8fafc;
-  color: #475569;
-  border-radius: 4px;
-  cursor: pointer;
-}
-
-.btn-mode-tab.active {
-  background: #0f172a;
-  color: white;
-  border-color: #0f172a;
-}
-
-.batch-actions-bar {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  background-color: #f1f5f9;
-  padding: 6px;
-  border-radius: 6px;
-}
-
-.selected-count {
-  font-size: 0.725rem;
-  font-weight: 600;
-  color: #2563eb;
-}
-
-.btn-batch-select-all {
-  align-self: flex-start;
-  padding: 2px 5px;
-  font-size: 0.7rem;
-  border: 1px solid #cbd5e1;
-  border-radius: 4px;
-  background: #fff;
-  cursor: pointer;
-}
-
+.batch-actions-bar { display: flex; flex-direction: column; gap: 6px; background-color: #f1f5f9; padding: 6px; border-radius: 6px; }
+.selected-count { font-size: 0.725rem; font-weight: 600; color: #2563eb; }
+.btn-batch-select-all { align-self: flex-start; padding: 2px 5px; font-size: 0.7rem; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; cursor: pointer; }
 .batch-btns { display: flex; gap: 4px; flex-wrap: wrap; }
-
-.batch-btns button {
-  padding: 3px 6px;
-  font-size: 0.7rem;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-weight: 600;
-}
-
+.batch-btns button { padding: 3px 6px; font-size: 0.7rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
 .btn-batch-active { background-color: #10b981; color: white; }
 .btn-batch-rest { background-color: #f59e0b; color: white; }
 .btn-batch-reset { background-color: #6366f1; color: white; }
 .btn-batch-delete { background-color: #ef4444; color: white; }
 
-.queue-container {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  overflow-y: auto;
-  padding-right: 2px;
-  flex: 1;
-}
-
+.queue-container { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-right: 2px; flex: 1; }
 .queue-group { display: flex; flex-direction: column; }
-
-.group-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 5px 8px;
-  background-color: #f1f5f9;
-  border-radius: 6px;
-  font-size: 0.8rem;
-  font-weight: bold;
-  margin-bottom: 4px;
-  color: #334155;
-  user-select: none;
-}
-
+.group-header { display: flex; justify-content: space-between; align-items: center; padding: 5px 8px; background-color: #f1f5f9; border-radius: 6px; font-size: 0.8rem; font-weight: bold; margin-bottom: 4px; color: #334155; user-select: none; }
 .group-title { display: flex; align-items: center; gap: 4px; }
 .collapse-icon { font-size: 0.6rem; color: #64748b; }
 .group-count { font-size: 0.7rem; color: #64748b; font-weight: normal; }
-
 .checkbox-wrapper { margin-right: 4px; display: flex; align-items: center; }
 
-.modal-overlay {
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background-color: rgba(15, 23, 42, 0.6);
-  backdrop-filter: blur(4px);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  z-index: 1000;
-  padding: 16px;
-  box-sizing: border-box;
-}
+.modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px); display: flex; justify-content: center; align-items: center; z-index: 1000; padding: 16px; box-sizing: border-box; }
+.modal-card { background: #ffffff; border-radius: 14px; width: 100%; max-width: 460px; padding: 18px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1); max-height: 90vh; overflow-y: auto; box-sizing: border-box; }
+.history-modal-card { max-width: 600px; }
+.history-modal-body { max-height: 400px; overflow-y: auto; }
 
-.modal-card {
-  background: #ffffff;
-  border-radius: 14px;
-  width: 100%;
-  max-width: 440px;
-  padding: 18px;
-  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
-  max-height: 90vh;
-  overflow-y: auto;
-  box-sizing: border-box;
-}
-
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  border-bottom: 1px solid #f1f5f9;
-  padding-bottom: 6px;
-}
-
+.modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
 .modal-header h3 { margin: 0; font-size: 1rem; color: #0f172a; }
-
-.btn-close {
-  border: none;
-  background: transparent;
-  font-size: 1rem;
-  color: #94a3b8;
-  cursor: pointer;
-}
-
+.btn-close { border: none; background: transparent; font-size: 1rem; color: #94a3b8; cursor: pointer; }
 .modal-body { display: flex; flex-direction: column; gap: 10px; }
 .form-group { display: flex; flex-direction: column; gap: 4px; }
 .form-group label { font-size: 0.8rem; font-weight: 600; color: #334155; }
 .hint-text { font-size: 0.7rem; color: #64748b; }
 
-.form-input, .form-select {
-  padding: 6px 10px;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  font-size: 0.85rem;
-  outline: none;
-  background-color: #fff;
-}
+.form-input, .form-select { padding: 6px 10px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 0.85rem; outline: none; background-color: #fff; }
+.avoid-checkboxes { max-height: 120px; overflow-y: auto; border: 1px solid #cbd5e1; padding: 6px; border-radius: 6px; background: #f8fafc; }
 
-.modal-footer {
-  margin-top: 14px;
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
+.history-list { display: flex; flex-direction: column; gap: 8px; }
+.history-item { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; }
+.history-item-top { display: flex; justify-content: space-between; font-size: 0.75rem; color: #64748b; font-weight: 600; }
+.h-players { display: flex; gap: 6px; flex-wrap: wrap; }
+.h-player-tag { background: #e0f2fe; color: #0369a1; padding: 2px 8px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; }
 
-.btn-cancel, .btn-save {
-  padding: 6px 12px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 0.825rem;
-}
-
+.modal-footer { margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px; }
+.btn-cancel, .btn-save { padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.825rem; }
 .btn-cancel { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
 .btn-save { background: #2563eb; color: white; border: none; }
+.btn-danger-sub { background-color: #dc2626 !important; }
 
 @media (max-width: 1100px) {
   .setup-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2397,17 +1777,5 @@ const getGenderText = (gender: string) => {
   .courts-section { max-height: none; overflow-y: visible; }
   .queue-section { position: static; max-height: 450px; }
   .courts-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
-}
-
-@media (max-width: 499px) {
-  .app-header { padding: 8px 10px; }
-  .app-title { font-size: 1.05rem; }
-  .header-top-row { flex-direction: column; align-items: flex-start; gap: 6px; }
-  .session-filter-bar { width: 100%; overflow-x: auto; }
-  .header-controls { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-  .court-selector { grid-column: 1 / -1; margin-left: 0; justify-content: space-between; }
-  .courts-grid { grid-template-columns: 1fr; }
-  .setup-container { padding: 10px; }
-  .player-list, .player-card { touch-action: none; }
 }
 </style>
