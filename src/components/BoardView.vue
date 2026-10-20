@@ -949,8 +949,11 @@ const dragOptions = computed(() => ({
   animation: 200,
   group: "badminton-app",
   ghostClass: "ghost",
-  delay: 50,
-  delayOnTouchOnly: true
+  // 增加下面這幾行設定，能大幅改善行動裝置上的拖曳流暢度
+  delay: 0,                 // 移除觸控延遲（或設為 50~100ms 避免跟點擊衝突）
+  touchStartThreshold: 5,   // 手指滑動超過 5px 才正式觸發拖曳，避免輕觸時卡住
+  forceFallback: true,      // 啟用強制降級渲染（使用模擬的拖曳圖層，解決部分 iOS/Android 原生拖曳 API 閃爍或失效的問題）
+  fallbackClass: "sortable-fallback"
 }));
 
 const getLevelClass = (level: string | number) => {
@@ -2569,6 +2572,11 @@ const getGenderText = (gender: string) => {
 
   .setup-container {
     padding: 10px;
+  }
+
+  /* 讓所有 draggable 容器與卡片都禁用預設的觸控捲動行為 */
+  .player-list, .player-card {
+    touch-action: none;
   }
 }
 </style>
