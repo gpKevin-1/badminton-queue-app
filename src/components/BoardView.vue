@@ -1,1644 +1,2574 @@
 <script setup lang="ts">
-  import { ref, computed, onMounted, onUnmounted } from 'vue';
-  import { VueDraggableNext as draggable } from 'vue-draggable-next';
-  import axios from 'axios';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { VueDraggableNext as draggable } from 'vue-draggable-next';
 
-  // --- 1. 資料型別定義 ---
+// --- 1. 資料型別定義 ---
+export interface Player {
+  id: number | string;
+  name: string;
+  gender: string; // 'M' | 'F' | '-' (無/未指定)
+  playedCount: number;
+  level: string; // 1 ~ 15 級
+  status?: '1' | '0'; // '1': 排隊中/比賽中, '0': 休息/請假
+  sessions: string[]; // 選手報名的時段標籤 (例: ['18:00-20:00', '20:00-22:00'])
+  partnerId?: number | string | null; // 👥 綁定搭檔 ID
+}
 
-  export interface Player {
-    id: number | string;
-    name: string;
-    gender: string;
-    playedCount: number;
-    level: string; // 1 ~ 15 級
-    status?: '1' | '0'; // '1': 排隊中/比賽中, '0': 休息/請假
+export interface Court {
+  id: number;
+  name: string;
+  players: Player[];        // 目前正在場上的球員
+  nextPlayers: Player[];    // 預先排點區的球員
+  status: 'idle' | 'playing';
+  startTime?: number | null;
+  elapsedSeconds?: number;
+}
+
+export interface SessionConfig {
+  courtCount: number;
+  maxPlayersCount: number;
+  maxGamesPerPlayer: number;
+  timeSlots: string[];      // 今日開啟的時段列表
+}
+
+// --- 時段解析與排序輔助函式 ---
+const parseTimeSlot = (slotStr: string): number => {
+  const match = slotStr.match(/\d+(:?\d+)?/);
+  if (!match) return 0;
+  const timeStr = match[0];
+  if (timeStr.includes(':')) {
+    const [h, m] = timeStr.split(':').map(Number);
+    return h * 100 + (m || 0);
   }
+  return Number(timeStr) * 100;
+};
 
-  export interface Court {
-    id: number;
-    name: string;
-    players: Player[];        // 目前正在場上的球員
-    nextPlayers: Player[];    // 預先排點區的球員
-    status: 'idle' | 'playing';
-    startTime?: number | null;
-    elapsedSeconds?: number;
+// --- 2. 狀態宣告 ---
+const STORAGE_KEY_PLAYERS = 'badminton_queue_players_data';
+const STORAGE_KEY_CONFIG = 'badminton_queue_config_data';
+
+// 預設開場時段
+const DEFAULT_TIME_SLOTS = ['18:00-20:00', '20:00-22:00'];
+
+// 視圖切換：'setup' (開場設定) | 'board' (看板主畫面)
+const currentView = ref<'setup' | 'board'>('board');
+
+// 今日活動開場設定
+const sessionConfig = ref<SessionConfig>({
+  courtCount: 3,
+  maxPlayersCount: 20,
+  maxGamesPerPlayer: 4,
+  timeSlots: [...DEFAULT_TIME_SLOTS]
+});
+
+// 時段新增輸入框 (Setup 頁面)
+const newSlotInput = ref<string>('');
+
+// 看板時段篩選器：'all' 或特定的時段字串
+const currentSessionFilter = ref<string>('all');
+
+// 依據時間順序自動排序後的時段列表 (供畫面渲染使用)
+const sortedTimeSlots = computed(() => {
+  return [...sessionConfig.value.timeSlots].sort((a, b) => parseTimeSlot(a) - parseTimeSlot(b));
+});
+
+const queuePlayers = ref<Player[]>([]);
+const isLoading = ref<boolean>(false);
+const isDev = ref<boolean>(false);
+
+// 批次報名相關狀態 (Setup 頁面使用)
+const batchText = ref<string>('');
+const batchDefaultGender = ref<string>('-');
+const batchDefaultLevel = ref<string>('5');
+const batchDefaultSessions = ref<string[]>([...DEFAULT_TIME_SLOTS]); // 預設帶入的時段
+
+// Modal 狀態
+const isEditModalOpen = ref<boolean>(false);
+const editingPlayer = ref<Player | null>(null);
+
+const isAddModalOpen = ref<boolean>(false);
+const newPlayer = ref<Omit<Player, 'id'>>({
+  name: '',
+  gender: '-',
+  playedCount: 0,
+  level: '5',
+  status: '1',
+  sessions: [],
+  partnerId: null
+});
+
+// 批次選擇狀態 (看板使用)
+const isBatchMode = ref<boolean>(false);
+const selectedPlayerIds = ref<(number | string)[]>([]);
+
+// 控制佇列分區收合
+const collapsedGroups = ref<Record<string, boolean>>({
+  high: false, mid: false, low: false,
+  fresh: false, moderate: false, veteran: false,
+  restingGroup: false, completedGroup: false
+});
+
+const courts = ref<Court[]>([]);
+
+// --- 動態上限與限制邏輯 ---
+const getPlayerMaxGames = (player: Player): number => {
+  const baseMax = sessionConfig.value.maxGamesPerPlayer || 4;
+  const sessionCount = player.sessions && player.sessions.length > 0 ? player.sessions.length : 1;
+  return baseMax * sessionCount;
+};
+
+const isPlayerLimitReached = (player: Player): boolean => {
+  return player.playedCount >= getPlayerMaxGames(player);
+};
+
+// 輔助函式：取得搭檔物件
+const getPartner = (player: Player): Player | undefined => {
+  if (!player.partnerId) return undefined;
+  return queuePlayers.value.find(p => String(p.id) === String(player.partnerId));
+};
+
+// --- 時段管理邏輯 (Setup 頁) ---
+const addTimeSlot = () => {
+  const val = newSlotInput.value.trim();
+  if (!val) return;
+  if (sessionConfig.value.timeSlots.includes(val)) {
+    alert('該時段已存在！');
+    return;
   }
+  sessionConfig.value.timeSlots.push(val);
+  sessionConfig.value.timeSlots.sort((a, b) => parseTimeSlot(a) - parseTimeSlot(b));
+  
+  if (!batchDefaultSessions.value.includes(val)) {
+    batchDefaultSessions.value.push(val);
+  }
+  newSlotInput.value = '';
+};
 
-  // --- 2. 判斷環境與狀態宣告 ---
+const removeTimeSlot = (index: number) => {
+  const removed = sessionConfig.value.timeSlots.splice(index, 1)[0];
+  batchDefaultSessions.value = batchDefaultSessions.value.filter(s => s !== removed);
+};
 
-  // 自動判斷目前是開發環境 (npm run dev) 還是正式上線環境 (npm run build)
-  const isDev = import.meta.env.DEV; 
-  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://badminton-api-bqbs.onrender.com/api/players';
-  const STORAGE_KEY = 'badminton_queue_players_data';
+const resetTimeSlotsToDefault = () => {
+  sessionConfig.value.timeSlots = [...DEFAULT_TIME_SLOTS];
+  batchDefaultSessions.value = [...DEFAULT_TIME_SLOTS];
+};
 
-  const queuePlayers = ref<Player[]>([]);
-  const isLoading = ref<boolean>(false);
-
-  // Modal 狀態
-  const isEditModalOpen = ref<boolean>(false);
-  const editingPlayer = ref<Player | null>(null);
-
-  const isAddModalOpen = ref<boolean>(false);
-  const newPlayer = ref<Omit<Player, 'id'>>({
-    name: '',
-    gender: 'M',
-    playedCount: 0,
-    level: '5',
-    status: '1'
-  });
-
-  // 批次選擇狀態
-  const isBatchMode = ref<boolean>(false);
-  const selectedPlayerIds = ref<(number | string)[]>([]);
-
-  // 場地數量與清單
-  const courtNumbersOptions = [1, 2, 3, 4, 5, 6, 7, 8];
-  const selectedCourtCount = ref<number>(5);
-
-  // 控制佇列分區收合 (預設展開: false)
-  const collapsedGroups = ref<Record<string, boolean>>({
-    high: false,
-    mid: false,
-    low: false,
-    fresh: false,
-    moderate: false,
-    veteran: false,
-    restingGroup: false
-  });
-
-  const courts = ref<Court[]>(
-    Array.from({ length: 5 }, (_, i) => ({
-      id: i + 1,
-      name: `${i + 1}號場`,
-      players: [],
-      nextPlayers: [],
-      status: 'idle',
-      startTime: null,
-      elapsedSeconds: 0
-    }))
-  );
-
-  // --- 3. localStorage 輔助函式 (僅在生產環境或 API 失敗時使用) ---
-
-  const saveToLocalStorage = () => {
-    if (!isDev) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(queuePlayers.value));
-    }
-  };
-
-  const loadFromLocalStorage = (): Player[] => {
-    const data = localStorage.getItem(STORAGE_KEY);
-    if (data) {
-      try {
-        return JSON.parse(data);
-      } catch (e) {
-        console.error('解析 localStorage 失敗:', e);
-      }
-    }
-    // 預設初始靜態資料
-    return [
-      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1' },
-      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1' },
-      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1' },
-      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1' },
-      { id: 5, name: '李洋', gender: 'M', playedCount: 0, level: '12', status: '1' },
-      { id: 6, name: '王齊麟', gender: 'M', playedCount: 0, level: '12', status: '1' },
-      { id: 7, name: '球友A', gender: 'M', playedCount: 1, level: '8', status: '1' },
-      { id: 8, name: '球友B', gender: 'F', playedCount: 0, level: '4', status: '0' }
-    ];
-  };
-
-  // --- 4. 等待佇列排序與分區計算 ---
-
-  const queueGroupMode = ref<'level' | 'playedCount' | 'resting'>('level');
-
-  const toggleGroupMode = (mode: 'level' | 'playedCount' | 'resting') => {
-    queueGroupMode.value = mode;
-    selectedPlayerIds.value = [];
-  };
-
-  const currentTabPlayers = computed(() => {
-    if (queueGroupMode.value === 'resting') {
-      return queuePlayers.value.filter(p => String(p.status) === '0');
+const initCourts = (count: number) => {
+  const newCourts: Court[] = [];
+  for (let i = 1; i <= count; i++) {
+    const existing = courts.value.find(c => c.id === i);
+    if (existing) {
+      newCourts.push(existing);
     } else {
-      return queuePlayers.value.filter(p => String(p.status) !== '0');
-    }
-  });
-
-  const sortedQueuePlayers = computed(() => {
-    return [...queuePlayers.value].sort((a, b) => {
-      if (queueGroupMode.value === 'level') {
-        const levelA = Number(a.level) || 0;
-        const levelB = Number(b.level) || 0;
-        if (levelB !== levelA) return levelB - levelA;
-        return a.playedCount - b.playedCount;
-      } else {
-        if (a.playedCount !== b.playedCount) return a.playedCount - b.playedCount;
-        return (Number(b.level) || 0) - (Number(a.level) || 0);
-      }
-    });
-  });
-
-  const groupedQueuePlayers = computed(() => {
-    if (queueGroupMode.value === 'resting') {
-      const restingPlayers = sortedQueuePlayers.value.filter(p => String(p.status) === '0');
-      return [
-        { title: '💤 休息請假中', key: 'restingGroup', players: restingPlayers }
-      ];
-    }
-
-    const activePlayers = sortedQueuePlayers.value.filter(p => String(p.status) !== '0');
-
-    if (queueGroupMode.value === 'level') {
-      const high: Player[] = [];
-      const mid: Player[] = [];
-      const low: Player[] = [];
-
-      activePlayers.forEach(p => {
-        const lvl = Number(p.level) || 0;
-        if (lvl >= 11) high.push(p);
-        else if (lvl >= 6) mid.push(p);
-        else low.push(p);
+      newCourts.push({
+        id: i,
+        name: `${i}號場`,
+        players: [],
+        nextPlayers: [],
+        status: 'idle',
+        startTime: null,
+        elapsedSeconds: 0
       });
-
-      return [
-        { title: '🔥 高階分區 (11~15級)', key: 'high', players: high },
-        { title: '⚡ 中階分區 (6~10級)', key: 'mid', players: mid },
-        { title: '🌱 初階分區 (1~5級)', key: 'low', players: low }
-      ];
-    } else {
-      const fresh: Player[] = [];
-      const moderate: Player[] = [];
-      const veteran: Player[] = [];
-
-      activePlayers.forEach(p => {
-        const count = p.playedCount || 0;
-        if (count === 0) fresh.push(p);
-        else if (count <= 2) moderate.push(p);
-        else veteran.push(p);
-      });
-
-      return [
-        { title: '🆕 未上場 (0場)', key: 'fresh', players: fresh },
-        { title: '🎾 已上場一半 (1~2場)', key: 'moderate', players: moderate },
-        { title: '🔥 好多場 (3場以上)', key: 'veteran', players: veteran }
-      ];
     }
-  });
+  }
+  courts.value = newCourts;
+};
 
-  const toggleGroupCollapse = (key: string) => {
-    collapsedGroups.value[key] = !collapsedGroups.value[key];
-  };
+// --- 3. localStorage 本地快取操作 ---
+const saveToLocalStorage = () => {
+  localStorage.setItem(STORAGE_KEY_PLAYERS, JSON.stringify(queuePlayers.value));
+  localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(sessionConfig.value));
+};
 
-  // --- 5. 初始化與 API / 本地資料載入 ---
-
-  const fetchPlayersFromAPI = async () => {
-    // 情況 A：正式發布環境 (Production) -> 純前端 localStorage 模式
-    if (!isDev) {
-      queuePlayers.value = loadFromLocalStorage();
-      return;
-    }
-
-    // 情況 B：本地開發環境 (Development) -> 發送 HTTP API 請求
+const loadFromLocalStorage = () => {
+  const configData = localStorage.getItem(STORAGE_KEY_CONFIG);
+  if (configData) {
     try {
-      isLoading.value = true;
-      const response = await axios.get<Player[]>(API_BASE_URL);
-      queuePlayers.value = response.data;
-    } catch (error) {
-      console.error('API 連線失敗，載入預設資料:', error);
-      queuePlayers.value = loadFromLocalStorage();
-    } finally {
-      isLoading.value = false;
+      const parsed = JSON.parse(configData);
+      const loadedSlots = parsed.timeSlots || [...DEFAULT_TIME_SLOTS];
+      loadedSlots.sort((a: string, b: string) => parseTimeSlot(a) - parseTimeSlot(b));
+
+      sessionConfig.value = {
+        ...parsed,
+        timeSlots: loadedSlots
+      };
+      batchDefaultSessions.value = [...sessionConfig.value.timeSlots];
+    } catch (e) {
+      console.error('解析 Config 失敗:', e);
     }
-  };
+  }
 
-  // --- 6. 計時器邏輯 ---
+  const playerData = localStorage.getItem(STORAGE_KEY_PLAYERS);
+  if (playerData) {
+    try {
+      const parsedPlayers = JSON.parse(playerData);
+      queuePlayers.value = parsedPlayers.map((p: any) => ({
+        ...p,
+        sessions: Array.isArray(p.sessions) ? p.sessions : (sessionConfig.value.timeSlots.slice(0, 1)),
+        partnerId: p.partnerId || null
+      }));
+    } catch (e) {
+      console.error('解析 Players 失敗:', e);
+    }
+  } else {
+    const defaultSlots = sessionConfig.value.timeSlots;
+    queuePlayers.value = [
+      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1', sessions: [...defaultSlots], partnerId: null },
+      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: null },
+      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null },
+      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null },
+      { id: 5, name: '李洋', gender: 'M', playedCount: 0, level: '12', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: 6 },
+      { id: 6, name: '王齊麟', gender: 'M', playedCount: 0, level: '12', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: 5 },
+      { id: 7, name: '球友A', gender: '-', playedCount: 1, level: '8', status: '1', sessions: [...defaultSlots], partnerId: null },
+      { id: 8, name: '球友B', gender: '-', playedCount: 0, level: '4', status: '0', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null }
+    ];
+  }
+  initCourts(sessionConfig.value.courtCount);
+};
 
-  const timerInterval = ref<ReturnType<typeof setInterval> | null>(null);
+// --- 4. 批次解析與匯入邏輯 ---
+const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, offsetIndex: number): boolean => {
+  const cleanName = playerData.name.trim();
+  if (!cleanName) return false;
 
-  const startGlobalTimer = () => {
-    if (timerInterval.value) return;
-    timerInterval.value = setInterval(() => {
-      const now = Date.now();
-      courts.value.forEach(court => {
-        if (court.status === 'playing' && court.startTime) {
-          court.elapsedSeconds = Math.floor((now - court.startTime) / 1000);
+  const existingPlayer = queuePlayers.value.find(p => p.name.trim() === cleanName);
+
+  if (existingPlayer) {
+    const combinedSessions = Array.from(new Set([...existingPlayer.sessions, ...playerData.sessions]));
+    existingPlayer.sessions = combinedSessions;
+
+    if (playerData.gender !== '-' && existingPlayer.gender === '-') {
+      existingPlayer.gender = playerData.gender;
+    }
+    return false;
+  } else {
+    queuePlayers.value.push({
+      id: nowTimestamp + offsetIndex,
+      ...playerData,
+      name: cleanName
+    });
+    return true;
+  }
+};
+
+const parseAndImportText = () => {
+  if (!batchText.value.trim()) return alert('請先貼上選手名單！');
+
+  const lines = batchText.value.split('\n');
+  let now = Date.now();
+  let countAdded = 0;
+  let countMerged = 0;
+
+  lines.forEach((line, index) => {
+    let cleanLine = line.trim();
+    if (!cleanLine) return;
+
+    cleanLine = cleanLine.replace(/^[\d+[\.\)\-\s]+/, '').trim();
+    if (!cleanLine) return;
+
+    const tokens = cleanLine.split(/[\s,，]+/);
+    const name = tokens[0];
+    if (!name) return;
+
+    let gender = batchDefaultGender.value;
+    let level = batchDefaultLevel.value;
+    let detectedSessions: string[] = [];
+
+    tokens.slice(1).forEach(token => {
+      const upper = token.toUpperCase();
+      if (['M', '男', 'MALE'].includes(upper)) gender = 'M';
+      else if (['F', '女', 'FEMALE'].includes(upper)) gender = 'F';
+
+      const numMatch = token.match(/\d+/);
+      if (numMatch) {
+        const lvlNum = parseInt(numMatch[0], 10);
+        if (lvlNum >= 1 && lvlNum <= 15) level = String(lvlNum);
+      }
+
+      sessionConfig.value.timeSlots.forEach(slot => {
+        if (token.includes(slot) || slot.includes(token)) {
+          if (!detectedSessions.includes(slot)) detectedSessions.push(slot);
         }
       });
-    }, 1000);
-  };
-
-  const formatTime = (seconds?: number): string => {
-    if (!seconds || seconds < 0) return '00:00';
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-  };
-
-  onMounted(() => {
-    fetchPlayersFromAPI();
-    startGlobalTimer();
-  });
-
-  onUnmounted(() => {
-    if (timerInterval.value) clearInterval(timerInterval.value);
-  });
-
-  // --- 7. 拖曳連動處理 (Drag & Drop Sync) ---
-
-  const getDraggedPlayer = (evt: any): Player | null => {
-    return evt?.item?._underlying_vm_ || evt?.draggedContext?.element || null;
-  };
-
-  const handlePlayerAddedToCourt = (evt: any) => {
-    const player = getDraggedPlayer(evt);
-    if (!player) return;
-
-    const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
-    if (idx !== -1) {
-      queuePlayers.value.splice(idx, 1);
-      saveToLocalStorage();
-    }
-  };
-
-  const handlePlayerAddedToQueue = (evt: any) => {
-    const player = getDraggedPlayer(evt);
-    if (!player) return;
-
-    courts.value.forEach(court => {
-      court.players = court.players.filter(p => String(p.id) !== String(player.id));
-      court.nextPlayers = court.nextPlayers.filter(p => String(p.id) !== String(player.id));
     });
 
-    if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
-      queuePlayers.value.push(player);
-      saveToLocalStorage();
-    }
-  };
+    const finalSessions = detectedSessions.length > 0
+      ? detectedSessions
+      : (batchDefaultSessions.value.length > 0 ? [...batchDefaultSessions.value] : [...sessionConfig.value.timeSlots]);
 
-  // --- 8. 選手 CRUD 與動態批次操作 ---
+    const isNewItem = addOrMergePlayer({
+      name,
+      gender,
+      level,
+      playedCount: 0,
+      status: '1',
+      sessions: finalSessions,
+      partnerId: null
+    }, now, index);
 
-  const openAddModal = () => {
-    newPlayer.value = { name: '', gender: 'M', playedCount: 0, level: '5', status: '1' };
-    isAddModalOpen.value = true;
-  };
+    if (isNewItem) countAdded++;
+    else countMerged++;
+  });
 
-  const closeAddModal = () => { isAddModalOpen.value = false; };
+  saveToLocalStorage();
+  alert(`解析完成！新增 ${countAdded} 位全新選手，合併 ${countMerged} 位重複選手時段。`);
+  batchText.value = '';
+};
 
-  const saveNewPlayer = async () => {
-    if (!newPlayer.value.name.trim()) return alert('請輸入選手姓名！');
+const handleFileUpload = (event: Event) => {
+  const file = (event.target as HTMLInputElement).files?.[0];
+  if (!file) return;
 
-    const localNewPlayer: Player = {
-      id: Date.now(),
-      name: newPlayer.value.name.trim(),
-      gender: newPlayer.value.gender,
-      playedCount: Number(newPlayer.value.playedCount || 0),
-      level: String(newPlayer.value.level),
-      status: newPlayer.value.status || '1'
-    };
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const text = e.target?.result as string;
+    if (!text) return;
 
-    if (isDev) {
-      const payload = {
-        id: "",
-        name: localNewPlayer.name,
-        gender: localNewPlayer.gender,
-        playedCount: localNewPlayer.playedCount,
-        level: localNewPlayer.level,
-        status: localNewPlayer.status
-      };
-      try {
-        const response = await axios.post<Player>(API_BASE_URL, payload);
-        queuePlayers.value.push(response.data);
-      } catch (err) {
-        queuePlayers.value.push(localNewPlayer);
+    const lines = text.split(/\r\n|\n/);
+    let now = Date.now();
+    let countAdded = 0;
+    let countMerged = 0;
+
+    lines.forEach((line, index) => {
+      if (!line.trim()) return;
+      const cols = line.split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+      
+      if (index === 0 && (cols[0].includes('姓名') || cols[0].includes('Name'))) return;
+
+      const name = cols[0];
+      if (!name) return;
+
+      let gender = batchDefaultGender.value;
+      if (cols[1]) {
+        const gUpper = cols[1].toUpperCase();
+        if (['F', '女'].includes(gUpper)) gender = 'F';
+        else if (['M', '男'].includes(gUpper)) gender = 'M';
       }
-    } else {
-      queuePlayers.value.push(localNewPlayer);
-      saveToLocalStorage();
-    }
-    closeAddModal();
-  };
 
-  const openEditModal = (player: Player) => {
-    editingPlayer.value = JSON.parse(JSON.stringify(player));
-    isEditModalOpen.value = true;
-  };
+      let level = cols[2] ? String(parseInt(cols[2], 10) || batchDefaultLevel.value) : batchDefaultLevel.value;
 
-  const closeEditModal = () => {
-    isEditModalOpen.value = false;
-    editingPlayer.value = null;
-  };
-
-  const savePlayerEdit = async () => {
-    if (!editingPlayer.value) return;
-    const targetId = editingPlayer.value.id;
-
-    if (isDev) {
-      const payload = {
-        id: String(targetId),
-        name: editingPlayer.value.name.trim(),
-        gender: editingPlayer.value.gender,
-        playedCount: Number(editingPlayer.value.playedCount),
-        level: String(editingPlayer.value.level),
-        status: editingPlayer.value.status
-      };
-
-      try {
-        await axios.put(`${API_BASE_URL}/${targetId}`, payload);
-        queuePlayers.value = queuePlayers.value.map(p => 
-          String(p.id) === String(targetId) ? { ...editingPlayer.value! } : p
-        );
-      } catch (err) {
-        alert('更新失敗，請檢查網路連線！');
-        return;
-      }
-    } else {
-      queuePlayers.value = queuePlayers.value.map(p => 
-        String(p.id) === String(targetId) ? { ...editingPlayer.value! } : p
-      );
-      saveToLocalStorage();
-    }
-    closeEditModal();
-  };
-
-  const toggleBatchMode = () => {
-    isBatchMode.value = !isBatchMode.value;
-    selectedPlayerIds.value = [];
-  };
-
-  const toggleSelectPlayer = (player: Player) => {
-    const isRestingTab = queueGroupMode.value === 'resting';
-    const isPlayerResting = String(player.status) === '0';
-
-    if (isRestingTab !== isPlayerResting) return;
-
-    const index = selectedPlayerIds.value.indexOf(player.id);
-    if (index > -1) {
-      selectedPlayerIds.value.splice(index, 1);
-    } else {
-      selectedPlayerIds.value.push(player.id);
-    }
-  };
-
-  const toggleSelectAll = () => {
-    const targetIds = currentTabPlayers.value.map(p => p.id);
-    if (selectedPlayerIds.value.length === targetIds.length && targetIds.length > 0) {
-      selectedPlayerIds.value = [];
-    } else {
-      selectedPlayerIds.value = [...targetIds];
-    }
-  };
-
-  const updateBatchStatus = async (targetStatus: '0' | '1') => {
-    if (selectedPlayerIds.value.length === 0) return;
-    const targetPlayers = queuePlayers.value.filter(p => selectedPlayerIds.value.includes(p.id));
-
-    targetPlayers.forEach(p => p.status = targetStatus);
-
-    if (isDev) {
-      await Promise.all(targetPlayers.map(async (player) => {
-        try {
-          await axios.put(`${API_BASE_URL}/${player.id}`, {
-            id: String(player.id),
-            name: player.name,
-            gender: player.gender,
-            playedCount: Number(player.playedCount),
-            level: String(player.level),
-            status: targetStatus
-          });
-        } catch (err) { console.warn(err); }
-      }));
-    } else {
-      saveToLocalStorage();
-    }
-
-    selectedPlayerIds.value = [];
-    isBatchMode.value = false;
-  };
-
-  const batchResetPlayedCount = async () => {
-    if (selectedPlayerIds.value.length === 0) return;
-    if (!confirm(`確定要將選中的 ${selectedPlayerIds.value.length} 位選手已打場數歸零嗎？`)) return;
-
-    isLoading.value = true;
-    const targetPlayers = queuePlayers.value.filter(p => selectedPlayerIds.value.includes(p.id));
-
-    targetPlayers.forEach(p => p.playedCount = 0);
-
-    if (isDev) {
-      await Promise.all(targetPlayers.map(async (player) => {
-        try {
-          await axios.put(`${API_BASE_URL}/${player.id}`, {
-            id: String(player.id),
-            name: player.name,
-            gender: player.gender,
-            playedCount: 0,
-            level: String(player.level),
-            status: player.status || '1'
-          });
-        } catch (err) { console.warn(err); }
-      }));
-    } else {
-      saveToLocalStorage();
-    }
-
-    isLoading.value = false;
-    selectedPlayerIds.value = [];
-    isBatchMode.value = false;
-  };
-
-  const batchDeletePlayers = async () => {
-    if (selectedPlayerIds.value.length === 0) return;
-    if (!confirm(`確定要刪除選中的 ${selectedPlayerIds.value.length} 位選手嗎？`)) return;
-
-    const idsToDelete = [...selectedPlayerIds.value];
-
-    if (isDev) {
-      await Promise.all(idsToDelete.map(async id => {
-        try { await axios.delete(`${API_BASE_URL}/${id}`); }
-        catch (err) { console.warn(err); }
-      }));
-    }
-
-    queuePlayers.value = queuePlayers.value.filter(p => !idsToDelete.includes(p.id));
-    saveToLocalStorage();
-
-    selectedPlayerIds.value = [];
-    isBatchMode.value = false;
-  };
-
-  // --- 9. 自動配對與場地管理 ---
-
-  const isPreferredLevel = (courtPlayers: Player[], targetPlayer: Player): boolean => {
-    if (courtPlayers.length === 0) return true;
-    const targetLevel = Number(targetPlayer.level);
-    if (isNaN(targetLevel)) return true;
-    return courtPlayers.every(p => Math.abs(Number(p.level) - targetLevel) <= 2);
-  };
-
-  const fillCourtAuto = (court: Court) => {
-    const activeQueue = queuePlayers.value.filter(p => String(p.status) !== '0');
-    activeQueue.sort((a, b) => a.playedCount - b.playedCount);
-
-    const fillZone = (targetZone: 'players' | 'nextPlayers', strictLevel: boolean) => {
-      let i = 0;
-      while (court[targetZone].length < 4 && i < activeQueue.length) {
-        const candidate = activeQueue[i];
-        if (candidate && (!strictLevel || isPreferredLevel(court[targetZone], candidate))) {
-          court[targetZone].push(candidate);
-          const idx = queuePlayers.value.findIndex(p => String(p.id) === String(candidate.id));
-          if (idx !== -1) queuePlayers.value.splice(idx, 1);
-          activeQueue.splice(i, 1);
-        } else { i++; }
-      }
-    };
-
-    if (court.status === 'idle' && court.players.length < 4) {
-      fillZone('players', true);
-      fillZone('players', false);
-    }
-    if (court.nextPlayers.length < 4) {
-      fillZone('nextPlayers', true);
-      fillZone('nextPlayers', false);
-    }
-
-    saveToLocalStorage();
-  };
-
-  const autoAssignAllCourts = () => {
-    if (queuePlayers.value.length === 0) return alert('目前佇列中沒有球員！');
-    courts.value.forEach(court => fillCourtAuto(court));
-  };
-
-  const updateCourtCount = () => {
-    const currentCount = courts.value.length;
-    const newCount = selectedCourtCount.value;
-
-    if (newCount > currentCount) {
-      for (let i = currentCount + 1; i <= newCount; i++) {
-        courts.value.push({ id: i, name: `${i}號場`, players: [], nextPlayers: [], status: 'idle', startTime: null, elapsedSeconds: 0 });
-      }
-    } else if (newCount < currentCount) {
-      const removedCourts = courts.value.splice(newCount);
-      removedCourts.forEach(court => {
-        court.players.concat(court.nextPlayers).forEach(p => {
-          if (!queuePlayers.value.some(q => String(q.id) === String(p.id))) {
-            queuePlayers.value.push(p);
+      let sessions: string[] = [];
+      if (cols[3]) {
+        const rawSess = cols[3].split(/[/;|]/);
+        sessionConfig.value.timeSlots.forEach(slot => {
+          if (rawSess.some(s => s.includes(slot) || slot.includes(s))) {
+            sessions.push(slot);
           }
         });
-      });
-      saveToLocalStorage();
-    }
-  };
-
-  const addPlayerToAvailableCourt = (player: Player) => {
-    const targetCourt = courts.value.find(c => c.status === 'idle' && c.players.length < 4 && isPreferredLevel(c.players, player))
-      || courts.value.find(c => c.nextPlayers.length < 4 && isPreferredLevel(c.nextPlayers, player))
-      || courts.value.find(c => c.status === 'idle' && c.players.length < 4)
-      || courts.value.find(c => c.nextPlayers.length < 4);
-
-    if (!targetCourt) return alert('目前所有場地與預備區皆已額滿！');
-
-    const zone = (targetCourt.status === 'idle' && targetCourt.players.length < 4) ? 'players' : 'nextPlayers';
-    const index = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
-    if (index !== -1) {
-      queuePlayers.value.splice(index, 1);
-      targetCourt[zone].push(player);
-      saveToLocalStorage();
-    }
-  };
-
-  const startMatch = (court: Court) => {
-    if (court.players.length !== 4) {
-      return alert(`【${court.name}】目前有 ${court.players.length} 人，必須湊齊 4 人才能開始比賽！`);
-    }
-    court.status = 'playing';
-    court.startTime = Date.now();
-    court.elapsedSeconds = 0;
-  };
-
-  const finishMatch = async (courtId: number) => {
-    const court = courts.value.find(c => c.id === courtId);
-    if (!court) return;
-
-    isLoading.value = true;
-    try {
-      court.players.forEach(p => p.playedCount += 1);
-
-      if (isDev) {
-        await Promise.all(court.players.map(async (player) => {
-          try {
-            await axios.put(`${API_BASE_URL}/${player.id}`, {
-              id: String(player.id),
-              name: player.name,
-              gender: player.gender,
-              playedCount: player.playedCount,
-              level: String(player.level),
-              status: player.status || '1'
-            });
-          } catch (err) { console.warn(err); }
-        }));
+      }
+      if (sessions.length === 0) {
+        sessions = batchDefaultSessions.value.length > 0 ? [...batchDefaultSessions.value] : [...sessionConfig.value.timeSlots];
       }
 
-      court.players.forEach(p => {
-        if (!queuePlayers.value.some(existing => String(existing.id) === String(p.id))) {
-          queuePlayers.value.push(p);
-        }
-      });
+      const isNewItem = addOrMergePlayer({
+        name,
+        gender,
+        level,
+        playedCount: 0,
+        status: '1',
+        sessions,
+        partnerId: null
+      }, now, index);
 
-      court.players = [...court.nextPlayers];
-      court.nextPlayers = [];
-      court.status = 'idle';
-      court.startTime = null;
-      court.elapsedSeconds = 0;
-
-      fillCourtAuto(court);
-      saveToLocalStorage();
-    } finally {
-      isLoading.value = false;
-    }
-  };
-
-  const clearAllCourts = async () => {
-    if (courts.value.some(c => c.status === 'playing') && !confirm('有場地正進行比賽，確定要清空嗎？')) return;
-
-    isLoading.value = true;
-    const playersToReturn: Player[] = [];
-
-    courts.value.forEach(court => {
-      court.players.forEach(p => playersToReturn.push(p));
-      court.nextPlayers.forEach(p => playersToReturn.push(p));
-
-      court.players = [];
-      court.nextPlayers = [];
-      court.status = 'idle';
-      court.startTime = null;
-      court.elapsedSeconds = 0;
+      if (isNewItem) countAdded++;
+      else countMerged++;
     });
-
-    playersToReturn.forEach(player => {
-      if (!queuePlayers.value.some(q => String(q.id) === String(player.id))) {
-        queuePlayers.value.push(player);
-      }
-    });
-
-    if (isDev) {
-      try {
-        await Promise.all(
-          playersToReturn.map(async (player) => {
-            await axios.put(`${API_BASE_URL}/${player.id}`, {
-              id: String(player.id),
-              name: player.name,
-              gender: player.gender,
-              playedCount: Number(player.playedCount),
-              level: String(player.level),
-              status: player.status || '1'
-            });
-          })
-        );
-      } catch (err) {
-        console.error('清空場地時同步後端失敗：', err);
-      }
-    }
 
     saveToLocalStorage();
-    isLoading.value = false;
+    alert(`CSV 匯入完成！新增 ${countAdded} 位全新選手，合併 ${countMerged} 位重複選手時段。`);
+  };
+  reader.readAsText(file);
+};
+
+const startSession = () => {
+  if (sessionConfig.value.courtCount < 1) return alert('請至少設定 1 個場地！');
+  if (sessionConfig.value.maxPlayersCount < 1) return alert('請設定有效的總人數上限！');
+  if (sessionConfig.value.maxGamesPerPlayer < 1) return alert('每人最多打場數必須至少為 1 場！');
+  if (sessionConfig.value.timeSlots.length === 0) return alert('請至少設定一個今日開場時段！');
+
+  initCourts(sessionConfig.value.courtCount);
+  saveToLocalStorage();
+  currentView.value = 'board';
+};
+
+const reopenSetup = () => { currentView.value = 'setup'; };
+
+// --- 5. 等待佇列排序與分區計算 ---
+const queueGroupMode = ref<'level' | 'playedCount' | 'resting'>('level');
+
+const toggleGroupMode = (mode: 'level' | 'playedCount' | 'resting') => {
+  queueGroupMode.value = mode;
+  selectedPlayerIds.value = [];
+};
+
+const filteredQueuePlayers = computed(() => {
+  if (currentSessionFilter.value === 'all') return queuePlayers.value;
+  return queuePlayers.value.filter(p => p.sessions && p.sessions.includes(currentSessionFilter.value));
+});
+
+const currentTabPlayers = computed(() => {
+  if (queueGroupMode.value === 'resting') {
+    return filteredQueuePlayers.value.filter(p => String(p.status) === '0');
+  } else {
+    return filteredQueuePlayers.value.filter(p => String(p.status) !== '0');
+  }
+});
+
+const sortedQueuePlayers = computed(() => {
+  return [...filteredQueuePlayers.value].sort((a, b) => {
+    if (queueGroupMode.value === 'level') {
+      const levelA = Number(a.level) || 0;
+      const levelB = Number(b.level) || 0;
+      if (levelB !== levelA) return levelB - levelA;
+      return a.playedCount - b.playedCount;
+    } else {
+      if (a.playedCount !== b.playedCount) return a.playedCount - b.playedCount;
+      return (Number(b.level) || 0) - (Number(a.level) || 0);
+    }
+  });
+});
+
+const groupedQueuePlayers = computed(() => {
+  if (queueGroupMode.value === 'resting') {
+    const restingPlayers = sortedQueuePlayers.value.filter(p => String(p.status) === '0');
+    return [{ title: '💤 休息請假中', key: 'restingGroup', players: restingPlayers }];
+  }
+
+  const activePlayers = sortedQueuePlayers.value.filter(p => String(p.status) !== '0');
+  const availablePlayers = activePlayers.filter(p => !isPlayerLimitReached(p));
+  const completedPlayers = activePlayers.filter(p => isPlayerLimitReached(p));
+
+  const resultList = [];
+
+  if (queueGroupMode.value === 'level') {
+    const high: Player[] = [];
+    const mid: Player[] = [];
+    const low: Player[] = [];
+
+    availablePlayers.forEach(p => {
+      const lvl = Number(p.level) || 0;
+      if (lvl >= 11) high.push(p);
+      else if (lvl >= 6) mid.push(p);
+      else low.push(p);
+    });
+
+    resultList.push(
+      { title: '🔥 高階分區 (11~15級)', key: 'high', players: high },
+      { title: '⚡ 中階分區 (6~10級)', key: 'mid', players: mid },
+      { title: '🌱 初階分區 (1~5級)', key: 'low', players: low }
+    );
+  } else {
+    const fresh: Player[] = [];
+    const moderate: Player[] = [];
+    const veteran: Player[] = [];
+
+    availablePlayers.forEach(p => {
+      const count = p.playedCount || 0;
+      if (count === 0) fresh.push(p);
+      else if (count <= 2) moderate.push(p);
+      else veteran.push(p);
+    });
+
+    resultList.push(
+      { title: '🆕 未上場 (0場)', key: 'fresh', players: fresh },
+      { title: '🎾 已上場一半 (1~2場)', key: 'moderate', players: moderate },
+      { title: '🔥 好多場 (3場以上)', key: 'veteran', players: veteran }
+    );
+  }
+
+  if (completedPlayers.length > 0) {
+    resultList.push({
+      title: `🏁 已達個人打球上限 (已完賽)`,
+      key: 'completedGroup',
+      players: completedPlayers
+    });
+  }
+
+  return resultList;
+});
+
+const toggleGroupCollapse = (key: string) => {
+  collapsedGroups.value[key] = !collapsedGroups.value[key];
+};
+
+// --- 6. 計時器邏輯 ---
+const timerInterval = ref<ReturnType<typeof setInterval> | null>(null);
+
+const startGlobalTimer = () => {
+  if (timerInterval.value) return;
+  timerInterval.value = setInterval(() => {
+    const now = Date.now();
+    courts.value.forEach(court => {
+      if (court.status === 'playing' && court.startTime) {
+        court.elapsedSeconds = Math.floor((now - court.startTime) / 1000);
+      }
+    });
+  }, 1000);
+};
+
+const formatTime = (seconds?: number): string => {
+  if (!seconds || seconds < 0) return '00:00';
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+};
+
+onMounted(() => {
+  loadFromLocalStorage();
+  startGlobalTimer();
+});
+
+onUnmounted(() => {
+  if (timerInterval.value) clearInterval(timerInterval.value);
+});
+
+// --- 7. 拖曳與看板操作 ---
+const getDraggedPlayer = (evt: any): Player | null => {
+  return evt?.item?._underlying_vm_ || evt?.draggedContext?.element || null;
+};
+
+const handlePlayerAddedToCourt = (evt: any) => {
+  const player = getDraggedPlayer(evt);
+  if (!player) return;
+
+  if (isPlayerLimitReached(player)) {
+    alert(`【${player.name}】已打滿個人上限 (${getPlayerMaxGames(player)} 場)，無法再安排上場！`);
+    handlePlayerAddedToQueue(evt);
+    return;
+  }
+
+  const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
+  if (idx !== -1) {
+    queuePlayers.value.splice(idx, 1);
+    saveToLocalStorage();
+  }
+};
+
+const handlePlayerAddedToQueue = (evt: any) => {
+  const player = getDraggedPlayer(evt);
+  if (!player) return;
+
+  courts.value.forEach(court => {
+    court.players = court.players.filter(p => String(p.id) !== String(player.id));
+    court.nextPlayers = court.nextPlayers.filter(p => String(p.id) !== String(player.id));
+  });
+
+  if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
+    queuePlayers.value.push(player);
+    saveToLocalStorage();
+  }
+};
+
+const openAddModal = () => {
+  if (queuePlayers.value.length >= sessionConfig.value.maxPlayersCount) {
+    if (!confirm(`目前人數 (${queuePlayers.value.length}人) 已達到上限 (${sessionConfig.value.maxPlayersCount}人)，確定要繼續新增嗎？`)) {
+      return;
+    }
+  }
+  newPlayer.value = { 
+    name: '', 
+    gender: '-', 
+    playedCount: 0, 
+    level: '5', 
+    status: '1',
+    sessions: [...sessionConfig.value.timeSlots],
+    partnerId: null
+  };
+  isAddModalOpen.value = true;
+};
+
+const closeAddModal = () => { isAddModalOpen.value = false; };
+
+const saveNewPlayer = () => {
+  if (!newPlayer.value.name.trim()) return alert('請輸入選手姓名！');
+
+  addOrMergePlayer({
+    name: newPlayer.value.name.trim(),
+    gender: newPlayer.value.gender,
+    playedCount: Number(newPlayer.value.playedCount || 0),
+    level: String(newPlayer.value.level),
+    status: newPlayer.value.status || '1',
+    sessions: newPlayer.value.sessions && newPlayer.value.sessions.length > 0 
+      ? [...newPlayer.value.sessions] 
+      : [...sessionConfig.value.timeSlots],
+    partnerId: null
+  }, Date.now(), 0);
+
+  saveToLocalStorage();
+  closeAddModal();
+};
+
+const openEditModal = (player: Player) => {
+  editingPlayer.value = JSON.parse(JSON.stringify(player));
+  if (!editingPlayer.value!.sessions) {
+    editingPlayer.value!.sessions = [...sessionConfig.value.timeSlots];
+  }
+  isEditModalOpen.value = true;
+};
+
+const closeEditModal = () => {
+  isEditModalOpen.value = false;
+  editingPlayer.value = null;
+};
+
+const savePlayerEdit = () => {
+  if (!editingPlayer.value) return;
+  const targetId = editingPlayer.value.id;
+  const newPartnerId = editingPlayer.value.partnerId ? String(editingPlayer.value.partnerId) : null;
+
+  // 1. 取得舊資料以確認搭檔變更情況
+  const oldPlayer = queuePlayers.value.find(p => String(p.id) === String(targetId));
+  const oldPartnerId = oldPlayer?.partnerId ? String(oldPlayer.partnerId) : null;
+
+  // 2. 更新目標選手
+  queuePlayers.value = queuePlayers.value.map(p => {
+    if (String(p.id) === String(targetId)) {
+      return { ...editingPlayer.value!, partnerId: newPartnerId };
+    }
+    return p;
+  });
+
+  // 3. 處理雙向搭檔綁定與解除
+  if (oldPartnerId !== newPartnerId) {
+    // 若原先有舊搭檔，幫舊搭檔解除綁定
+    if (oldPartnerId) {
+      queuePlayers.value.forEach(p => {
+        if (String(p.id) === oldPartnerId && String(p.partnerId) === String(targetId)) {
+          p.partnerId = null;
+        }
+      });
+    }
+    // 若設定了新搭檔，幫新搭檔雙向綁定
+    if (newPartnerId) {
+      queuePlayers.value.forEach(p => {
+        if (String(p.id) === newPartnerId) {
+          // 若新搭檔原本也有其他舊搭檔，解除其關係
+          if (p.partnerId && String(p.partnerId) !== String(targetId)) {
+            const prevPartner = queuePlayers.value.find(x => String(x.id) === String(p.partnerId));
+            if (prevPartner) prevPartner.partnerId = null;
+          }
+          p.partnerId = targetId;
+        }
+      });
+    }
+  }
+
+  saveToLocalStorage();
+  closeEditModal();
+};
+
+const toggleBatchMode = () => {
+  isBatchMode.value = !isBatchMode.value;
+  selectedPlayerIds.value = [];
+};
+
+const toggleSelectPlayer = (player: Player) => {
+  const isRestingTab = queueGroupMode.value === 'resting';
+  const isPlayerResting = String(player.status) === '0';
+  if (isRestingTab !== isPlayerResting) return;
+
+  const index = selectedPlayerIds.value.indexOf(player.id);
+  if (index > -1) {
+    selectedPlayerIds.value.splice(index, 1);
+  } else {
+    selectedPlayerIds.value.push(player.id);
+  }
+};
+
+const toggleSelectAll = () => {
+  const targetIds = currentTabPlayers.value.map(p => p.id);
+  if (selectedPlayerIds.value.length === targetIds.length && targetIds.length > 0) {
+    selectedPlayerIds.value = [];
+  } else {
+    selectedPlayerIds.value = [...targetIds];
+  }
+};
+
+const updateBatchStatus = (targetStatus: '0' | '1') => {
+  if (selectedPlayerIds.value.length === 0) return;
+  queuePlayers.value.forEach(p => {
+    if (selectedPlayerIds.value.includes(p.id)) p.status = targetStatus;
+  });
+  saveToLocalStorage();
+  selectedPlayerIds.value = [];
+  isBatchMode.value = false;
+};
+
+const batchResetPlayedCount = () => {
+  if (selectedPlayerIds.value.length === 0) return;
+  if (!confirm(`確定要將選中的 ${selectedPlayerIds.value.length} 位選手已打場數歸零嗎？`)) return;
+
+  queuePlayers.value.forEach(p => {
+    if (selectedPlayerIds.value.includes(p.id)) p.playedCount = 0;
+  });
+  saveToLocalStorage();
+  selectedPlayerIds.value = [];
+  isBatchMode.value = false;
+};
+
+const batchDeletePlayers = () => {
+  if (selectedPlayerIds.value.length === 0) return;
+  if (!confirm(`確定要刪除選中的 ${selectedPlayerIds.value.length} 位選手嗎？`)) return;
+
+  // 清除被刪除選手的搭檔關號
+  queuePlayers.value.forEach(p => {
+    if (p.partnerId && selectedPlayerIds.value.includes(p.partnerId)) {
+      p.partnerId = null;
+    }
+  });
+
+  queuePlayers.value = queuePlayers.value.filter(p => !selectedPlayerIds.value.includes(p.id));
+  saveToLocalStorage();
+  selectedPlayerIds.value = [];
+  isBatchMode.value = false;
+};
+
+const removeSinglePlayerInSetup = (id: number | string) => {
+  queuePlayers.value.forEach(p => {
+    if (String(p.partnerId) === String(id)) p.partnerId = null;
+  });
+  queuePlayers.value = queuePlayers.value.filter(p => String(p.id) !== String(id));
+  saveToLocalStorage();
+};
+
+const clearAllPlayersInSetup = () => {
+  if (confirm('確定要清空目前所有的選手報名名單嗎？')) {
+    queuePlayers.value = [];
+    saveToLocalStorage();
+  }
+};
+
+// --- 8. 自動配對與場地管理 ---
+const isPreferredLevel = (courtPlayers: Player[], targetPlayer: Player): boolean => {
+  if (courtPlayers.length === 0) return true;
+  const targetLevel = Number(targetPlayer.level);
+  if (isNaN(targetLevel)) return true;
+  return courtPlayers.every(p => Math.abs(Number(p.level) - targetLevel) <= 2);
+};
+
+// 填補單一場地指定區域的輔助函式 (含有捆綁搭檔邏輯)
+const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', activeQueue: Player[]) => {
+  const tryAddPlayerAndPartner = (candidate: Player, strictLevel: boolean): boolean => {
+    if (court[targetZone].length >= 4) return false;
+    if (strictLevel && !isPreferredLevel(court[targetZone], candidate)) return false;
+
+    // 檢查是否有搭檔
+    const partner = activeQueue.find(p => String(p.id) === String(candidate.partnerId));
+
+    if (partner) {
+      // 空間不足容納搭檔雙人，跳過
+      if (court[targetZone].length > 2) return false;
+      if (strictLevel && !isPreferredLevel(court[targetZone], partner)) return false;
+
+      // 加入主要選手與搭檔
+      court[targetZone].push(candidate, partner);
+
+      // 從佇列陣列中移除
+      [candidate, partner].forEach(item => {
+        const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(item.id));
+        if (idxInQueue !== -1) queuePlayers.value.splice(idxInQueue, 1);
+
+        const idxInActive = activeQueue.findIndex(p => String(p.id) === String(item.id));
+        if (idxInActive !== -1) activeQueue.splice(idxInActive, 1);
+      });
+      return true;
+    } else {
+      // 無搭檔，單人加入
+      court[targetZone].push(candidate);
+
+      const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(candidate.id));
+      if (idxInQueue !== -1) queuePlayers.value.splice(idxInQueue, 1);
+
+      const idxInActive = activeQueue.findIndex(p => String(p.id) === String(candidate.id));
+      if (idxInActive !== -1) activeQueue.splice(idxInActive, 1);
+
+      return true;
+    }
   };
 
-  // --- 10. 輔助設定 ---
+  // 階段 1：實施等級相近優先機制 (strictLevel = true)
+  let i = 0;
+  while (court[targetZone].length < 4 && i < activeQueue.length) {
+    const candidate = activeQueue[i];
+    if (candidate) {
+      const added = tryAddPlayerAndPartner(candidate, true);
+      if (!added) i++;
+    } else {
+      i++;
+    }
+  }
 
-  const dragOptions = computed(() => ({
-    animation: 200,
-    group: "badminton-app",
-    ghostClass: "ghost",
-    delay: 50,
-    delayOnTouchOnly: true
-  }));
+  // 階段 2：若是還沒補滿，放寬等級限制補滿 (strictLevel = false)
+  i = 0;
+  while (court[targetZone].length < 4 && i < activeQueue.length) {
+    const candidate = activeQueue[i];
+    if (candidate) {
+      const added = tryAddPlayerAndPartner(candidate, false);
+      if (!added) i++;
+    } else {
+      i++;
+    }
+  }
+};
 
-  const getLevelClass = (level: string | number) => {
-    const num = Number(level);
-    return (!isNaN(num) && num >= 1 && num <= 15) ? `level-${num}` : '';
-  };
+// 單場補滿邏輯 (依序補滿 players 再補 nextPlayers)
+const fillCourtAuto = (court: Court) => {
+  const activeQueue = filteredQueuePlayers.value.filter(p => String(p.status) !== '0' && !isPlayerLimitReached(p));
+  activeQueue.sort((a, b) => a.playedCount - b.playedCount);
+
+  if (court.status === 'idle' && court.players.length < 4) {
+    fillZoneForCourt(court, 'players', activeQueue);
+  }
+  if (court.nextPlayers.length < 4) {
+    fillZoneForCourt(court, 'nextPlayers', activeQueue);
+  }
+  saveToLocalStorage();
+};
+
+// 全場一鍵自動配對：優先將【所有場地】的正選區 (players) 補滿，再補預備區 (nextPlayers)
+const autoAssignAllCourts = () => {
+  const activeQueue = filteredQueuePlayers.value.filter(p => String(p.status) !== '0' && !isPlayerLimitReached(p));
+  if (activeQueue.length === 0) return alert('目前佇列中沒有可安排上場的球員！');
+  
+  activeQueue.sort((a, b) => a.playedCount - b.playedCount);
+
+  // 1st Round: 優先遍歷所有場地，把【空閒場地的場上位置 (players)】補滿
+  courts.value.forEach(court => {
+    if (court.status === 'idle' && court.players.length < 4) {
+      fillZoneForCourt(court, 'players', activeQueue);
+    }
+  });
+
+  // 2nd Round: 所有場地的場上位置都滿了之後，才遍歷補滿【預備區 (nextPlayers)】
+  courts.value.forEach(court => {
+    if (court.nextPlayers.length < 4) {
+      fillZoneForCourt(court, 'nextPlayers', activeQueue);
+    }
+  });
+
+  saveToLocalStorage();
+};
+
+const updateCourtCountFromBoard = () => {
+  initCourts(sessionConfig.value.courtCount);
+  saveToLocalStorage();
+};
+
+const addPlayerToAvailableCourt = (player: Player) => {
+  if (isPlayerLimitReached(player)) {
+    return alert(`【${player.name}】已打滿個人上限 (${getPlayerMaxGames(player)} 場)，無法繼續上場！`);
+  }
+
+  const partner = getPartner(player);
+  const neededSlots = partner ? 2 : 1;
+
+  if (partner && isPlayerLimitReached(partner)) {
+    return alert(`搭檔【${partner.name}】已打滿個人上限，無法一起上場！`);
+  }
+
+  // 尋找適合的場地
+  const targetCourt = courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots && isPreferredLevel(c.players, player))
+    || courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots)
+    || courts.value.find(c => (4 - c.nextPlayers.length) >= neededSlots && isPreferredLevel(c.nextPlayers, player))
+    || courts.value.find(c => (4 - c.nextPlayers.length) >= neededSlots);
+
+  if (!targetCourt) return alert(`目前無場地有足夠空位 (${neededSlots}人)！`);
+
+  const zone = (targetCourt.status === 'idle' && (4 - targetCourt.players.length) >= neededSlots) ? 'players' : 'nextPlayers';
+  
+  // 搬移主要選手
+  const index = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
+  if (index !== -1) {
+    queuePlayers.value.splice(index, 1);
+    targetCourt[zone].push(player);
+  }
+
+  // 搬移搭檔選手
+  if (partner) {
+    const partnerIndex = queuePlayers.value.findIndex(p => String(p.id) === String(partner.id));
+    if (partnerIndex !== -1) {
+      queuePlayers.value.splice(partnerIndex, 1);
+      targetCourt[zone].push(partner);
+    }
+  }
+
+  saveToLocalStorage();
+};
+
+const startMatch = (court: Court) => {
+  if (court.players.length !== 4) {
+    return alert(`【${court.name}】目前有 ${court.players.length} 人，必須湊齊 4 人才能開始比賽！`);
+  }
+  court.status = 'playing';
+  court.startTime = Date.now();
+  court.elapsedSeconds = 0;
+};
+
+const finishMatch = (courtId: number) => {
+  const court = courts.value.find(c => c.id === courtId);
+  if (!court) return;
+
+  court.players.forEach(p => p.playedCount += 1);
+  court.players.forEach(p => {
+    if (!queuePlayers.value.some(existing => String(existing.id) === String(p.id))) {
+      queuePlayers.value.push(p);
+    }
+  });
+
+  court.players = [...court.nextPlayers];
+  court.nextPlayers = [];
+  court.status = 'idle';
+  court.startTime = null;
+  court.elapsedSeconds = 0;
+
+  fillCourtAuto(court);
+  saveToLocalStorage();
+};
+
+const clearAllCourts = () => {
+  if (courts.value.some(c => c.status === 'playing') && !confirm('有場地正進行比賽，確定要清空嗎？')) return;
+
+  courts.value.forEach(court => {
+    court.players.concat(court.nextPlayers).forEach(p => {
+      if (!queuePlayers.value.some(q => String(q.id) === String(p.id))) {
+        queuePlayers.value.push(p);
+      }
+    });
+    court.players = [];
+    court.nextPlayers = [];
+    court.status = 'idle';
+    court.startTime = null;
+    court.elapsedSeconds = 0;
+  });
+
+  saveToLocalStorage();
+};
+
+const dragOptions = computed(() => ({
+  animation: 200,
+  group: "badminton-app",
+  ghostClass: "ghost",
+  delay: 50,
+  delayOnTouchOnly: true
+}));
+
+const getLevelClass = (level: string | number) => {
+  const num = Number(level);
+  return (!isNaN(num) && num >= 1 && num <= 15) ? `level-${num}` : '';
+};
+
+const getGenderText = (gender: string) => {
+  if (gender === 'M') return '♂';
+  if (gender === 'F') return '♀';
+  return '';
+};
 </script>
 
 <template>
   <div class="app-main-layout">
-    <header class="app-header">
-      <div class="header-content">
-        <h1 class="app-title">
-          🏸 羽球場邊排點看板 
-          <span class="mode-badge" :class="isDev ? 'dev' : 'prod'">
-            {{ isDev ? '⚡ 本地開發 API 模式' : '💾 正式離線暫存模式' }}
-          </span>
-        </h1>
-        <div class="header-controls">
-          <button class="btn-add-player" @click="openAddModal">➕ 選手報名</button>
-          <button class="btn-auto-assign" @click="autoAssignAllCourts">⚡ 一鍵自動排點</button>
-          <button class="btn-clear-courts" @click="clearAllCourts" :disabled="isLoading">🗑 清空場地</button>
+    <!-- 畫面 1: 今日開場參數與批次報名設定 -->
+    <div v-if="currentView === 'setup'" class="setup-container">
+      <div class="setup-grid">
+        <!-- 左側：活動參數設定 -->
+        <div class="setup-card">
+          <div class="setup-header">
+            <h2>🏸 1. 今日開場參數設定</h2>
+            <p>設定場地數、預計總人數、個人單時段上限與開放時段</p>
+          </div>
 
-          <div class="court-selector">
-            <label for="courtCount">場地數量:</label>
-            <select id="courtCount" v-model="selectedCourtCount" @change="updateCourtCount">
-              <option v-for="num in courtNumbersOptions" :key="num" :value="num">{{ num }} 個場地</option>
-            </select>
+          <div class="setup-form">
+            <div class="form-item">
+              <label for="setupCourts">🏟️ 開現場地數量：</label>
+              <div class="input-with-unit">
+                <input id="setupCourts" type="number" min="1" max="16" v-model.number="sessionConfig.courtCount" class="setup-input" />
+                <span>個場地</span>
+              </div>
+            </div>
+
+            <div class="form-item">
+              <label for="setupMaxPlayers">👥 今日預計總人數：</label>
+              <div class="input-with-unit">
+                <input id="setupMaxPlayers" type="number" min="1" max="100" v-model.number="sessionConfig.maxPlayersCount" class="setup-input" />
+                <span>人</span>
+              </div>
+            </div>
+
+            <div class="form-item">
+              <label for="setupMaxGames">🎾 單一時段最多打幾場：</label>
+              <div class="input-with-unit">
+                <input id="setupMaxGames" type="number" min="1" max="20" v-model.number="sessionConfig.maxGamesPerPlayer" class="setup-input" />
+                <span>場/時段</span>
+              </div>
+              <small class="hint-text">💡 報名 2 個時段的選手，總上限將自動倍增（如 4 場 ➔ 8 場）。</small>
+            </div>
+
+            <!-- 今日開場時段設定 -->
+            <div class="form-item">
+              <div class="slot-label-row">
+                <label>⏰ 今日開放時段：</label>
+                <button class="btn-reset-slots" @click="resetTimeSlotsToDefault" title="歸為預設開場時段">🔄 恢復預設時段</button>
+              </div>
+              <div class="slots-editor">
+                <div v-for="(slot, idx) in sessionConfig.timeSlots" :key="idx" class="slot-tag">
+                  <span>{{ slot }}</span>
+                  <button class="btn-remove-slot" @click="removeTimeSlot(idx)">✕</button>
+                </div>
+              </div>
+              <div class="add-slot-row">
+                <input type="text" v-model="newSlotInput" placeholder="例: 18:00-20:00" class="setup-input small-input" @keyup.enter="addTimeSlot" />
+                <button class="btn-add-slot" @click="addTimeSlot">➕ 新增時段</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="setup-actions">
+            <button class="btn-start-session" @click="startSession">🚀 完成設定，進入排點看板</button>
+          </div>
+        </div>
+
+        <!-- 右側：批次報名匯入工具 -->
+        <div class="setup-card">
+          <div class="setup-header">
+            <h2>📋 2. 選手批次報名</h2>
+            <p>可直接複製 LINE 名單貼上，或讀取 CSV 檔案 (自動併入重複人名與時段)</p>
+          </div>
+
+          <div class="batch-defaults">
+            <div class="default-item">
+              <label>預設性別：</label>
+              <select v-model="batchDefaultGender" class="small-select">
+                <option value="-">⚪ 無 / 不指定</option>
+                <option value="M">♂ 男</option>
+                <option value="F">♀ 女</option>
+              </select>
+            </div>
+            <div class="default-item">
+              <label>預設等級：</label>
+              <select v-model="batchDefaultLevel" class="small-select">
+                <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- 報名時段預設勾選區 -->
+          <div class="batch-sessions-select">
+            <label class="session-label">預設帶入時段：</label>
+            <div class="checkbox-group">
+              <label v-for="slot in sessionConfig.timeSlots" :key="slot" class="checkbox-item">
+                <input type="checkbox" :value="slot" v-model="batchDefaultSessions" />
+                <span>{{ slot }}</span>
+              </label>
+            </div>
+          </div>
+
+          <!-- 方式 1: 貼上多行名單 -->
+          <div class="form-item">
+            <label>快速貼上名單（每行一位，支援包含等級/性別/時段）：</label>
+            <textarea 
+              v-model="batchText" 
+              rows="4" 
+              class="batch-textarea" 
+              placeholder="範例格式（同名選手將自動合併時段）：
+1. 戴資穎 F 15級 18:00-20:00
+2. 林丹 M 15級 20:00-22:00
+3. 周天成 11 18:00-20:00
+4. 周天成 11 20:00-22:00"
+            ></textarea>
+            <button class="btn-import-text" @click="parseAndImportText">📥 批次匯入文字名單</button>
+          </div>
+
+          <hr class="divider" />
+
+          <!-- 方式 2: CSV 檔案上傳 -->
+          <div class="form-item">
+            <label>或 上傳 CSV 檔案匯入：</label>
+            <input type="file" accept=".csv" @change="handleFileUpload" class="file-input" />
+            <small class="tip">CSV 欄位順序：姓名, 性別(M/F), 等級(1-15), 時段(用 / 分隔)</small>
+          </div>
+        </div>
+
+        <!-- 下方：目前已報名名單預覽區 -->
+        <div class="setup-card full-width">
+          <div class="setup-header preview-header">
+            <h3>👥 目前已報名選手名單 ({{ queuePlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
+            <button class="btn-clear-all" @click="clearAllPlayersInSetup" v-if="queuePlayers.length > 0">🗑 清空名單</button>
+          </div>
+
+          <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用上方批次報名工具。</div>
+          <div v-else class="preview-player-tags">
+            <div v-for="p in queuePlayers" :key="p.id" class="preview-tag">
+              <span v-if="getGenderText(p.gender)" class="p-gender" :class="p.gender === 'M' ? 'male' : 'female'">{{ getGenderText(p.gender) }}</span>
+              <span class="p-name">{{ p.name }}</span>
+              <span class="p-level">{{ p.level }}級</span>
+              <span class="p-partner" v-if="getPartner(p)">🔗 {{ getPartner(p)?.name }}</span>
+              <span class="p-sessions" v-if="p.sessions && p.sessions.length">[{{ p.sessions.join(', ') }}]</span>
+              <button class="btn-remove-tag" @click="removeSinglePlayerInSetup(p.id)">✕</button>
+            </div>
           </div>
         </div>
       </div>
-    </header>
+    </div>
 
-    <main class="app-content-wrapper">
-      <!-- 左側場地區 -->
-      <section class="courts-section">
-        <div class="section-header">
-          <h2>🏸 場地動態 ({{ courts.length }} 個場地)</h2>
-        </div>
+    <!-- 畫面 2: 排點看板主畫面 -->
+    <template v-else>
+      <header class="app-header">
+        <div class="header-content">
+          <div class="header-top-row">
+            <h1 class="app-title">
+              🏸 羽球場邊排點看板 
+              <span class="mode-badge" :class="isDev ? 'dev' : 'prod'">
+                {{ isDev ? '⚡ 本地開發 API 模式' : '💾 正式離線暫存模式' }}
+              </span>
+            </h1>
 
-        <div class="courts-grid">
-          <div v-for="court in courts" :key="court.id" class="court-card" :class="court.status">
-            <div class="court-header">
-              <div class="title-with-status">
-                <h3>{{ court.name }}</h3>
-                <span class="status-badge" :class="court.status">
-                  {{ court.status === 'playing' ? '🔥 比賽中' : '⏳ 準備中' }}
-                </span>
-              </div>
-              <div class="court-header-right">
-                <span v-if="court.status === 'playing'" class="match-timer">⏱️ {{ formatTime(court.elapsedSeconds) }}</span>
-                <span class="player-count" :class="{ 'full': court.players.length === 4 }">{{ court.players.length }} / 4 人</span>
-              </div>
+            <!-- 時段切換過濾器 (依時間排序) -->
+            <div class="session-filter-bar">
+              <span class="filter-label">⏰ 時段篩選:</span>
+              <button class="btn-session-filter" :class="{ active: currentSessionFilter === 'all' }" @click="currentSessionFilter = 'all'">全部時段</button>
+              <button v-for="slot in sortedTimeSlots" :key="slot" class="btn-session-filter" :class="{ active: currentSessionFilter === slot }" @click="currentSessionFilter = slot">
+                {{ slot }}
+              </button>
             </div>
+          </div>
 
-            <!-- 現正對局 -->
-            <div class="zone-label">現正對局</div>
-            <draggable class="player-list court-player-list"
-                       v-model="court.players"
-                       v-bind="dragOptions"
-                       :disabled="court.status === 'playing'"
-                       :set-data="false"
-                       @add="handlePlayerAddedToCourt">
-              <div v-for="player in court.players" :key="player.id" class="player-card touch-action-none">
-                <div class="player-info">
-                  <span class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ player.gender === 'M' ? '♂' : '♀' }}</span>
-                  <span class="player-name">{{ player.name }}</span>
-                </div>
-                <div class="player-stats">
-                  <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
-                  <span class="played-tag">{{ player.playedCount }}場</span>
-                </div>
-              </div>
-            </draggable>
+          <div class="header-controls">
+            <button class="btn-setup-reconfig" @click="reopenSetup">⚙️ 調整開場設定</button>
+            <button class="btn-add-player" @click="openAddModal">➕ 選手報名</button>
+            <button class="btn-auto-assign" @click="autoAssignAllCourts">⚡ 一鍵自動排點</button>
+            <button class="btn-clear-courts" @click="clearAllCourts" :disabled="isLoading">🗑 清空場地</button>
 
-            <!-- 下局預備 -->
-            <div class="zone-label next-zone-label">
-              <span>📋 下局預備 ({{ court.nextPlayers.length }}/4)</span>
-            </div>
-            <draggable class="player-list court-player-list next-players-list"
-                       v-model="court.nextPlayers"
-                       v-bind="dragOptions"
-                       :set-data="false"
-                       @add="handlePlayerAddedToCourt">
-              <div v-for="player in court.nextPlayers" :key="player.id" class="player-card touch-action-none is-next-up">
-                <div class="player-info">
-                  <span class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ player.gender === 'M' ? '♂' : '♀' }}</span>
-                  <span class="player-name">{{ player.name }}</span>
-                </div>
-                <div class="player-stats">
-                  <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
-                  <span class="played-tag">{{ player.playedCount }}場</span>
-                </div>
-              </div>
-            </draggable>
-
-            <!-- 控制按鈕 -->
-            <div class="court-actions">
-              <button v-if="court.status === 'idle'" class="btn-start-match" @click="startMatch(court)">▶ 開始比賽</button>
-              <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局</button>
+            <div class="court-selector">
+              <label for="courtCount">場地數量:</label>
+              <select id="courtCount" v-model="sessionConfig.courtCount" @change="updateCourtCountFromBoard">
+                <option v-for="num in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 16]" :key="num" :value="num">{{ num }} 個場地</option>
+              </select>
             </div>
           </div>
         </div>
-      </section>
+      </header>
 
-      <!-- 右側等待佇列 -->
-      <section class="queue-section">
-        <div class="section-header">
-          <div class="header-title-group">
-            <h2>⏳ 等待佇列 ({{ queuePlayers.length }} 人)</h2>
-            <button class="btn-toggle-batch" :class="{ 'active': isBatchMode }" @click="toggleBatchMode">
-              {{ isBatchMode ? '✕ 取消選擇' : '☑ 批次選擇' }}
-            </button>
+      <main class="app-content-wrapper">
+        <!-- 左側場地區 (獨立區塊，可往下捲動) -->
+        <section class="courts-section">
+          <div class="section-header">
+            <h2>🏸 場地動態 ({{ courts.length }} 個場地)</h2>
           </div>
 
-          <!-- 分區 Tab -->
-          <div class="group-mode-switch">
-            <span class="switch-label">分區方式：</span>
-            <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'level' }" @click="toggleGroupMode('level')">
-              🏆 按等級
-            </button>
-            <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'playedCount' }" @click="toggleGroupMode('playedCount')">
-              🔢 按場次
-            </button>
-            <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'resting' }" @click="toggleGroupMode('resting')">
-              💤 休息中
-            </button>
-          </div>
-
-          <!-- 批次操作工具列 -->
-          <div v-if="isBatchMode" class="batch-actions-bar">
-            <button class="btn-batch-select-all" @click="toggleSelectAll">
-              {{ selectedPlayerIds.length === currentTabPlayers.length && currentTabPlayers.length > 0 ? '全不選' : '全選本頁' }}
-            </button>
-            <span class="selected-count">已選 {{ selectedPlayerIds.length }} 人</span>
-            <div class="batch-btns">
-              <button v-if="queueGroupMode === 'resting'" class="btn-batch-active" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('1')">🟢 設為上場</button>
-              <button v-else class="btn-batch-rest" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('0')">💤 設為休息</button>
-
-              <button class="btn-batch-reset" :disabled="selectedPlayerIds.length === 0" @click="batchResetPlayedCount">🔄 場次歸零</button>
-              <button class="btn-batch-delete" :disabled="selectedPlayerIds.length === 0" @click="batchDeletePlayers">🗑️ 刪除</button>
-            </div>
-          </div>
-          <span v-else class="header-tip">💡 點擊分區標題可展開/收合選手列表</span>
-        </div>
-
-        <div class="queue-container">
-          <div v-for="group in groupedQueuePlayers" :key="group.key" class="queue-group">
-            <div class="group-header clickable" @click="toggleGroupCollapse(group.key)">
-              <div class="group-title">
-                <span class="collapse-icon">{{ collapsedGroups[group.key] ? '►' : '▼' }}</span>
-                <span>{{ group.title }}</span>
+          <div class="courts-grid">
+            <div v-for="court in courts" :key="court.id" class="court-card" :class="court.status">
+              <div class="court-header">
+                <div class="title-with-status">
+                  <h3>{{ court.name }}</h3>
+                  <span class="status-badge" :class="court.status">
+                    {{ court.status === 'playing' ? '🔥 比賽中' : '⏳ 準備中' }}
+                  </span>
+                </div>
+                <div class="court-header-right">
+                  <span v-if="court.status === 'playing'" class="match-timer">⏱️ {{ formatTime(court.elapsedSeconds) }}</span>
+                  <span class="player-count" :class="{ 'full': court.players.length === 4 }">{{ court.players.length }} / 4人</span>
+                </div>
               </div>
-              <span class="group-count">{{ group.players.length }} 人</span>
-            </div>
 
-            <draggable v-show="!collapsedGroups[group.key]"
-                       class="player-list queue-player-list touch-action-none"
-                       v-model="group.players"
-                       v-bind="dragOptions"
-                       :disabled="isBatchMode"
-                       :set-data="false"
-                       @add="handlePlayerAddedToQueue">
-              <div v-for="player in group.players"
-                   :key="player.id"
-                   class="player-card clickable"
-                   :class="{ 
-                     'is-selected': selectedPlayerIds.includes(player.id), 
-                     'is-resting': String(player.status) === '0'
-                   }"
-                   @click="isBatchMode ? toggleSelectPlayer(player) : openEditModal(player)">
-
-                <div v-if="isBatchMode" class="checkbox-wrapper">
-                  <input type="checkbox" 
-                         :checked="selectedPlayerIds.includes(player.id)" 
-                         @click.stop="toggleSelectPlayer(player)" />
-                </div>
-
-                <div class="player-info">
-                  <span class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ player.gender === 'M' ? '♂' : '♀' }}</span>
-                  <span class="player-name">{{ player.name }}</span>
-                  <span v-if="String(player.status) === '0'" class="resting-badge">💤 休息</span>
-                </div>
-
-                <div class="player-actions-right">
+              <!-- 現正對局 -->
+              <div class="zone-label">
+                <span>🏸 現正對局</span>
+              </div>
+              <draggable class="player-list court-player-list"
+                         v-model="court.players"
+                         v-bind="dragOptions"
+                         :disabled="court.status === 'playing'"
+                         :set-data="false"
+                         @add="handlePlayerAddedToCourt">
+                <div v-for="player in court.players" :key="player.id" class="player-card touch-action-none">
+                  <div class="player-info">
+                    <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
+                    <span class="player-name">{{ player.name }}</span>
+                    <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+                  </div>
                   <div class="player-stats">
                     <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
-                    <span class="played-tag">已打: {{ player.playedCount }}場</span>
+                    <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
+                      {{ player.playedCount }} / {{ getPlayerMaxGames(player) }}場
+                    </span>
                   </div>
-                  <button v-if="!isBatchMode && String(player.status) !== '0'" class="btn-quick-add" title="快速排入" @click.stop="addPlayerToAvailableCourt(player)">➕</button>
                 </div>
+              </draggable>
+
+              <!-- 下局預備 -->
+              <div class="zone-label next-zone-label">
+                <span>📋 下局預備 ({{ court.nextPlayers.length }}/4)</span>
               </div>
-            </draggable>
-          </div>
-        </div>
-      </section>
-    </main>
+              <draggable class="player-list court-player-list next-players-list"
+                         v-model="court.nextPlayers"
+                         v-bind="dragOptions"
+                         :set-data="false"
+                         @add="handlePlayerAddedToCourt">
+                <div v-for="player in court.nextPlayers" :key="player.id" class="player-card touch-action-none is-next-up">
+                  <div class="player-info">
+                    <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
+                    <span class="player-name">{{ player.name }}</span>
+                    <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+                  </div>
+                  <div class="player-stats">
+                    <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
+                    <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
+                      {{ player.playedCount }} / {{ getPlayerMaxGames(player) }}場
+                    </span>
+                  </div>
+                </div>
+              </draggable>
 
-    <!-- Modal: 新增選手 -->
-    <div v-if="isAddModalOpen" class="modal-overlay" @click.self="closeAddModal">
-      <div class="modal-card">
-        <div class="modal-header">
-          <h3>➕ 新增選手報名</h3>
-          <button class="btn-close" @click="closeAddModal">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-group">
-            <label>姓名：</label>
-            <input type="text" v-model="newPlayer.name" placeholder="請輸入選手姓名" class="form-input" />
+              <!-- 控制按鈕 -->
+              <div class="court-actions">
+                <button v-if="court.status === 'idle'" class="btn-start-match" @click="startMatch(court)">▶ 開始比賽</button>
+                <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局</button>
+              </div>
+            </div>
           </div>
-          <div class="form-group">
-            <label>性別：</label>
-            <select v-model="newPlayer.gender" class="form-select">
-              <option value="M">♂ 男 (Male)</option>
-              <option value="F">♀ 女 (Female)</option>
-            </select>
+        </section>
+
+        <!-- 右側等待佇列 (固定獨立區塊) -->
+        <section class="queue-section">
+          <div class="section-header">
+            <div class="header-title-group">
+              <h2>⏳ 等待佇列 ({{ filteredQueuePlayers.length }} / {{ queuePlayers.length }} 人)</h2>
+              <button class="btn-toggle-batch" :class="{ 'active': isBatchMode }" @click="toggleBatchMode">
+                {{ isBatchMode ? '✕ 取消選擇' : '☑ 批次選擇' }}
+              </button>
+            </div>
+
+            <!-- 分區 Tab -->
+            <div class="group-mode-switch">
+              <span class="switch-label">分區方式：</span>
+              <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'level' }" @click="toggleGroupMode('level')">
+                🏆 按等級
+              </button>
+              <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'playedCount' }" @click="toggleGroupMode('playedCount')">
+                🔢 按場次
+              </button>
+              <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'resting' }" @click="toggleGroupMode('resting')">
+                💤 休息中
+              </button>
+            </div>
+
+            <!-- 批次操作工具列 -->
+            <div v-if="isBatchMode" class="batch-actions-bar">
+              <button class="btn-batch-select-all" @click="toggleSelectAll">
+                {{ selectedPlayerIds.length === currentTabPlayers.length && currentTabPlayers.length > 0 ? '全不選' : '全選本頁' }}
+              </button>
+              <span class="selected-count">已選 {{ selectedPlayerIds.length }} 人</span>
+              <div class="batch-btns">
+                <button v-if="queueGroupMode === 'resting'" class="btn-batch-active" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('1')">🟢 設為上場</button>
+                <button v-else class="btn-batch-rest" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('0')">💤 設為休息</button>
+
+                <button class="btn-batch-reset" :disabled="selectedPlayerIds.length === 0" @click="batchResetPlayedCount">🔄 場次歸零</button>
+                <button class="btn-batch-delete" :disabled="selectedPlayerIds.length === 0" @click="batchDeletePlayers">🗑️ 刪除</button>
+              </div>
+            </div>
+            <span v-else class="header-tip">💡 點擊選手卡片即可編輯資料或綁定搭檔</span>
           </div>
-          <div class="form-group">
-            <label>實力等級：</label>
-            <select v-model="newPlayer.level" class="form-select">
-              <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
-            </select>
+
+          <div class="queue-container">
+            <div v-for="group in groupedQueuePlayers" :key="group.key" class="queue-group">
+              <div class="group-header clickable" @click="toggleGroupCollapse(group.key)">
+                <div class="group-title">
+                  <span class="collapse-icon">{{ collapsedGroups[group.key] ? '►' : '▼' }}</span>
+                  <span>{{ group.title }}</span>
+                </div>
+                <span class="group-count">{{ group.players.length }} 人</span>
+              </div>
+
+              <draggable v-show="!collapsedGroups[group.key]"
+                         class="player-list queue-player-list touch-action-none"
+                         v-model="group.players"
+                         v-bind="dragOptions"
+                         :disabled="isBatchMode"
+                         :set-data="false"
+                         @add="handlePlayerAddedToQueue">
+                <div v-for="player in group.players"
+                     :key="player.id"
+                     class="player-card clickable"
+                     :class="{ 
+                       'is-selected': selectedPlayerIds.includes(player.id), 
+                       'is-resting': String(player.status) === '0',
+                       'is-completed': isPlayerLimitReached(player)
+                     }"
+                     @click="isBatchMode ? toggleSelectPlayer(player) : openEditModal(player)">
+
+                  <div v-if="isBatchMode" class="checkbox-wrapper">
+                    <input type="checkbox" 
+                           :checked="selectedPlayerIds.includes(player.id)" 
+                           @click.stop="toggleSelectPlayer(player)" />
+                  </div>
+
+                  <div class="player-info">
+                    <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
+                    <span class="player-name">{{ player.name }}</span>
+                    <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+                    <span v-if="String(player.status) === '0'" class="resting-badge">💤 休息</span>
+                    <span v-else-if="isPlayerLimitReached(player)" class="completed-badge">🏁 完賽</span>
+                    <span class="session-badge" v-if="player.sessions && player.sessions.length > 0">
+                      {{ player.sessions.length === sessionConfig.timeSlots.length ? '全時段' : player.sessions.join(',') }}
+                    </span>
+                  </div>
+
+                  <div class="player-actions-right">
+                    <div class="player-stats">
+                      <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
+                      <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
+                        已打: {{ player.playedCount }}/{{ getPlayerMaxGames(player) }}場
+                      </span>
+                    </div>
+                    <button v-if="!isBatchMode && String(player.status) !== '0' && !isPlayerLimitReached(player)" class="btn-quick-add" title="快速排入" @click.stop="addPlayerToAvailableCourt(player)">➕</button>
+                  </div>
+                </div>
+              </draggable>
+            </div>
           </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn-cancel" @click="closeAddModal">取消</button>
-          <button class="btn-save" @click="saveNewPlayer">確認報名</button>
+        </section>
+      </main>
+
+      <!-- Modal: 新增選手 -->
+      <div v-if="isAddModalOpen" class="modal-overlay" @click.self="closeAddModal">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h3>➕ 新增選手報名</h3>
+            <button class="btn-close" @click="closeAddModal">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="form-group">
+              <label>姓名：</label>
+              <input type="text" v-model="newPlayer.name" placeholder="請輸入選手姓名" class="form-input" />
+            </div>
+            <div class="form-group">
+              <label>性別：</label>
+              <select v-model="newPlayer.gender" class="form-select">
+                <option value="-">⚪ 無 / 不指定</option>
+                <option value="M">♂ 男 (Male)</option>
+                <option value="F">♀ 女 (Female)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>實力等級：</label>
+              <select v-model="newPlayer.level" class="form-select">
+                <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>報名時段 (可複選)：</label>
+              <div class="checkbox-group">
+                <label v-for="slot in sessionConfig.timeSlots" :key="slot" class="checkbox-item">
+                  <input type="checkbox" :value="slot" v-model="newPlayer.sessions" />
+                  <span>{{ slot }}</span>
+                </label>
+              </div>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn-cancel" @click="closeAddModal">取消</button>
+            <button class="btn-save" @click="saveNewPlayer">確認報名</button>
+          </div>
         </div>
       </div>
-    </div>
 
-    <!-- Modal: 編輯選手 -->
-    <div v-if="isEditModalOpen && editingPlayer" class="modal-overlay" @click.self="closeEditModal">
-      <div class="modal-card">
-        <div class="modal-header">
-          <h3>✏️ 編輯選手資料</h3>
-          <button class="btn-close" @click="closeEditModal">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="form-group">
-            <label>姓名：</label>
-            <input type="text" v-model="editingPlayer.name" class="form-input" />
+      <!-- Modal: 編輯選手 -->
+      <div v-if="isEditModalOpen && editingPlayer" class="modal-overlay" @click.self="closeEditModal">
+        <div class="modal-card">
+          <div class="modal-header">
+            <h3>✏️ 編輯選手資料</h3>
+            <button class="btn-close" @click="closeEditModal">✕</button>
           </div>
-          <div class="form-group">
-            <label>性別：</label>
-            <select v-model="editingPlayer.gender" class="form-select">
-              <option value="M">♂ 男 (Male)</option>
-              <option value="F">♀ 女 (Female)</option>
-            </select>
+          <div class="modal-body">
+            <div class="form-group">
+              <label>姓名：</label>
+              <input type="text" v-model="editingPlayer.name" class="form-input" />
+            </div>
+            
+            <!-- 新增：綁定搭檔選擇欄位 -->
+            <div class="form-group">
+              <label>👥 綁定搭檔 (一起上場)：</label>
+              <select v-model="editingPlayer.partnerId" class="form-select">
+                <option :value="null">-- 無搭檔 (單人排隊) --</option>
+                <option 
+                  v-for="p in queuePlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" 
+                  :key="p.id" 
+                  :value="p.id">
+                  {{ p.name }} ({{ p.level }}級{{ p.partnerId && String(p.partnerId) !== String(editingPlayer?.id) ? ' - 已有搭檔' : '' }})
+                </option>
+              </select>
+              <small class="hint-text">💡 設定綁定後，自動排點或點擊排入時會盡量將兩人安排在同一場。</small>
+            </div>
+
+            <div class="form-group">
+              <label>性別：</label>
+              <select v-model="editingPlayer.gender" class="form-select">
+                <option value="-">⚪ 無 / 不指定</option>
+                <option value="M">♂ 男 (Male)</option>
+                <option value="F">♀ 女 (Female)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>實力等級：</label>
+              <select v-model="editingPlayer.level" class="form-select">
+                <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>已打場數：</label>
+              <input type="number" min="0" v-model.number="editingPlayer.playedCount" class="form-input" />
+            </div>
+            <div class="form-group">
+              <label>出勤狀態：</label>
+              <select v-model="editingPlayer.status" class="form-select">
+                <option value="1">🟢 上場排隊中</option>
+                <option value="0">🔴 休息請假中</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>報名時段 (可複選)：</label>
+              <div class="checkbox-group">
+                <label v-for="slot in sessionConfig.timeSlots" :key="slot" class="checkbox-item">
+                  <input type="checkbox" :value="slot" v-model="editingPlayer.sessions" />
+                  <span>{{ slot }}</span>
+                </label>
+              </div>
+            </div>
           </div>
-          <div class="form-group">
-            <label>實力等級：</label>
-            <select v-model="editingPlayer.level" class="form-select">
-              <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
-            </select>
+          <div class="modal-footer">
+            <button class="btn-cancel" @click="closeEditModal">取消</button>
+            <button class="btn-save" @click="savePlayerEdit">儲存變更</button>
           </div>
-          <div class="form-group">
-            <label>已打場數：</label>
-            <input type="number" min="0" v-model.number="editingPlayer.playedCount" class="form-input" />
-          </div>
-          <div class="form-group">
-            <label>出勤狀態：</label>
-            <select v-model="editingPlayer.status" class="form-select">
-              <option value="1">🟢 上場排隊中</option>
-              <option value="0">🔴 休息請假中</option>
-            </select>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button class="btn-cancel" @click="closeEditModal">取消</button>
-          <button class="btn-save" @click="savePlayerEdit">儲存變更</button>
         </div>
       </div>
-    </div>
+    </template>
   </div>
 </template>
 
 <style scoped>
-.mode-badge {
+/* ==========================================
+   1. 全局配置與基礎變數
+   ========================================== */
+.app-main-layout {
+  min-height: 100vh;
+  min-height: 100dvh; /* 適應手機瀏覽器動態網址列 */
+  background-color: #f8fafc;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  color: #334155;
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.touch-action-none {
+  touch-action: none;
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+/* ==========================================
+   2. 畫面 1: 開場設定頁面 (Setup View)
+   ========================================== */
+.setup-container {
+  display: flex;
+  justify-content: center;
+  padding: 24px 20px;
+  max-width: 1100px;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+
+.setup-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 20px;
+  width: 100%;
+}
+
+.setup-card {
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid #e2e8f0;
+}
+
+.setup-card.full-width {
+  grid-column: 1 / -1;
+}
+
+.setup-header h2, .setup-header h3 {
+  font-size: 1.15rem;
+  color: #1e293b;
+  margin: 0 0 4px 0;
+}
+
+.setup-header p {
+  color: #64748b;
+  font-size: 0.825rem;
+  margin: 0;
+}
+
+.setup-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.form-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-item label {
+  font-weight: 600;
+  color: #334155;
+  font-size: 0.85rem;
+}
+
+.slot-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-reset-slots {
+  background: none;
+  border: none;
+  color: #2563eb;
   font-size: 0.75rem;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.input-with-unit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
+.setup-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.setup-input:focus {
+  border-color: #2563eb;
+}
+
+.setup-actions {
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.btn-start-session {
+  width: 100%;
+  padding: 12px;
+  background-color: #2563eb;
+  color: #ffffff;
+  font-size: 0.95rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.btn-start-session:hover {
+  background-color: #1d4ed8;
+}
+
+.slots-editor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.slot-tag {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background-color: #e0f2fe;
+  color: #0369a1;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.btn-remove-slot {
+  border: none;
+  background: transparent;
+  color: #0284c7;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0 2px;
+}
+
+.add-slot-row {
+  display: flex;
+  gap: 8px;
+}
+
+.small-input {
+  max-width: 160px;
+}
+
+.btn-add-slot {
+  padding: 6px 12px;
+  background-color: #0284c7;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.batch-defaults {
+  display: flex;
+  gap: 16px;
+  background-color: #f8fafc;
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin: 12px 0;
+  border: 1px solid #e2e8f0;
+  flex-wrap: wrap;
+}
+
+.default-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: #475569;
+}
+
+.small-select {
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid #cbd5e1;
+  background-color: #fff;
+  font-size: 0.8rem;
+}
+
+.session-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #475569;
+}
+
+.checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.checkbox-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: #334155;
+  cursor: pointer;
+}
+
+.batch-textarea {
+  width: 100%;
+  padding: 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 0.85rem;
+  resize: vertical;
+  box-sizing: border-box;
+  outline: none;
+}
+
+.btn-import-text {
+  margin-top: 8px;
+  padding: 8px 14px;
+  background-color: #059669;
+  color: #ffffff;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.divider {
+  border: none;
+  border-top: 1px dashed #e2e8f0;
+  margin: 14px 0;
+}
+
+.preview-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.btn-clear-all {
+  background-color: #ef4444;
+  color: white;
+  border: none;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.preview-player-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 10px;
+  background-color: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.preview-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: #ffffff;
+  border: 1px solid #cbd5e1;
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-size: 0.8rem;
+}
+
+.p-partner {
+  font-size: 0.72rem;
+  background-color: #fef3c7;
+  color: #92400e;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.btn-remove-tag {
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+/* ==========================================
+   3. 畫面 2: 頂部 Header 與控制工具列
+   ========================================== */
+.app-header {
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  color: #ffffff;
+  padding: 12px 16px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.header-content {
+  max-width: 1600px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.header-top-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.app-title {
+  font-size: 1.2rem;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  flex-wrap: wrap;
+}
+
+.mode-badge {
+  font-size: 0.7rem;
   padding: 2px 8px;
   border-radius: 12px;
-  margin-left: 8px;
-  vertical-align: middle;
+  font-weight: 500;
 }
-.mode-badge.dev {
-  background-color: #fff3cd;
-  color: #856404;
-  border: 1px solid #ffeeba;
-}
-.mode-badge.prod {
-  background-color: #d4edda;
-  color: #155724;
-  border: 1px solid #c3e6cb;
-}
-</style>
 
-<style scoped>
-  .app-main-layout {
-    height: 100dvh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background-color: #f0f2f5;
-    color: #333;
+.mode-badge.dev { background-color: #f59e0b; color: #fff; }
+.mode-badge.prod { background-color: #10b981; color: #fff; }
+
+.session-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.filter-label {
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.btn-session-filter {
+  background: rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-session-filter:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+}
+
+.btn-session-filter.active {
+  background: #2563eb;
+  color: #ffffff;
+  border-color: #3b82f6;
+  font-weight: 600;
+  box-shadow: 0 0 10px rgba(37, 99, 235, 0.4);
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.header-controls button {
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 34px;
+}
+
+.header-controls button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.btn-setup-reconfig { background-color: #334155; color: #f8fafc; }
+.btn-add-player { background-color: #059669; color: white; }
+.btn-auto-assign { background-color: #d97706; color: white; }
+.btn-clear-courts { background-color: #dc2626; color: white; }
+
+.court-selector {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  min-height: 34px;
+  box-sizing: border-box;
+}
+
+.court-selector select {
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid #475569;
+  background-color: #0f172a;
+  color: white;
+  outline: none;
+  font-weight: 600;
+}
+
+/* ==========================================
+   4. 主看板區域 (核心 雙欄 / 上下 彈性 Grid 佈局)
+   ========================================== */
+.app-content-wrapper {
+  max-width: 1600px;
+  margin: 12px auto 0 auto;
+  padding: 0 12px 12px 12px;
+  display: grid;
+  /* 預設雙欄：左側自動彈性適應，右側固定 320px 佇列 */
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+  align-items: start;
+  box-sizing: border-box;
+}
+
+/* 左側場地區 */
+.courts-section {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0; /* 避免 flex/grid 子項擠壓爆開 */
+  max-height: calc(100vh - 120px);
+  max-height: calc(100dvh - 120px);
+  overflow-y: auto; /* 獨立往下捲動 */
+  padding-right: 4px;
+}
+
+/* 右側等待佇列區 */
+.queue-section {
+  background: #ffffff;
+  border-radius: 14px;
+  padding: 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+  border: 1px solid #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+  max-height: calc(100vh - 120px);
+  max-height: calc(100dvh - 120px);
+  position: sticky;
+  top: 80px;
+  overflow-y: auto; /* 獨立垂直捲動 */
+}
+
+.section-header {
+  margin-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.section-header h2 {
+  font-size: 1.05rem;
+  margin: 0;
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.header-title-group {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.header-tip {
+  font-size: 0.725rem;
+  color: #64748b;
+}
+
+.courts-grid {
+  display: grid;
+  /* 自適應最小 250px 場地寬度，空間夠會自動併排 */
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.court-card {
+  background: #ffffff;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  padding: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.court-card.playing {
+  border-color: #3b82f6;
+  box-shadow: 0 6px 16px rgba(59, 130, 246, 0.12);
+}
+
+.court-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 6px;
+}
+
+.title-with-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.court-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.court-header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.match-timer {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: #1d4ed8;
+  background-color: #eff6ff;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid #bfdbfe;
+}
+
+.player-count {
+  font-size: 0.725rem;
+  color: #64748b;
+  background-color: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.player-count.full {
+  background-color: #dcfce7;
+  color: #15803d;
+}
+
+.status-badge {
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.status-badge.playing {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.zone-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #475569;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.next-zone-label {
+  margin-top: 2px;
+  color: #64748b;
+}
+
+.player-list {
+  min-height: 70px;
+  background-color: #f8fafc;
+  border: 1.5px dashed #cbd5e1;
+  border-radius: 8px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.player-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  cursor: grab;
+  user-select: none;
+}
+
+.player-card.is-next-up {
+  background-color: #fdfdfd;
+  border-style: dashed;
+}
+
+.player-info {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.825rem;
+  font-weight: 600;
+  flex-wrap: wrap;
+}
+
+.player-gender.male { color: #2563eb; }
+.player-gender.female { color: #ec4899; }
+
+.player-name { color: #1e293b; }
+
+.partner-badge {
+  font-size: 0.65rem;
+  background-color: #fef3c7;
+  color: #92400e;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.session-badge {
+  font-size: 0.65rem;
+  background-color: #e0f2fe;
+  color: #0369a1;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.resting-badge {
+  font-size: 0.65rem;
+  background-color: #fef3c7;
+  color: #b45309;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.completed-badge {
+  background-color: #fee2e2;
+  color: #dc2626;
+  font-size: 0.65rem;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.player-card.is-completed {
+  opacity: 0.75;
+  background-color: #f8fafc;
+  border-left: 3px solid #ef4444;
+}
+
+.player-card.is-resting {
+  opacity: 0.85;
+  background-color: #fffbeb;
+  border-left: 3px solid #f59e0b;
+}
+
+.player-card.is-selected {
+  border-color: #2563eb;
+  background-color: #eff6ff;
+}
+
+.player-stats {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.level-tag {
+  background-color: #f1f5f9;
+  color: #334155;
+  font-size: 0.7rem;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-weight: 700;
+}
+
+.played-tag {
+  font-size: 0.68rem;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.played-tag.limit-reached {
+  background-color: #ef4444;
+  color: #ffffff;
+  font-weight: bold;
+}
+
+.player-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.btn-quick-add {
+  background: #dbeafe;
+  color: #1d4ed8;
+  border: none;
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 0;
+}
+
+.court-actions {
+  margin-top: auto;
+  padding-top: 2px;
+}
+
+.btn-start-match, .btn-finish-match {
+  width: 100%;
+  padding: 8px;
+  border-radius: 6px;
+  border: none;
+  font-weight: 700;
+  font-size: 0.825rem;
+  cursor: pointer;
+}
+
+.btn-start-match { background-color: #16a34a; color: white; }
+.btn-finish-match { background-color: #dc2626; color: white; }
+
+/* ==========================================
+   5. 等待佇列區塊細節
+   ========================================== */
+.btn-toggle-batch {
+  padding: 3px 6px;
+  font-size: 0.725rem;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-toggle-batch.active {
+  background-color: #2563eb;
+  color: #ffffff;
+  border-color: #2563eb;
+}
+
+.group-mode-switch {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.switch-label {
+  font-size: 0.75rem;
+  color: #64748b;
+}
+
+.btn-mode-tab {
+  padding: 2px 6px;
+  font-size: 0.725rem;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc;
+  color: #475569;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-mode-tab.active {
+  background: #0f172a;
+  color: white;
+  border-color: #0f172a;
+}
+
+.batch-actions-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background-color: #f1f5f9;
+  padding: 6px;
+  border-radius: 6px;
+}
+
+.selected-count {
+  font-size: 0.725rem;
+  font-weight: 600;
+  color: #2563eb;
+}
+
+.btn-batch-select-all {
+  align-self: flex-start;
+  padding: 2px 5px;
+  font-size: 0.7rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.batch-btns {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.batch-btns button {
+  padding: 3px 6px;
+  font-size: 0.7rem;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-batch-active { background-color: #10b981; color: white; }
+.btn-batch-rest { background-color: #f59e0b; color: white; }
+.btn-batch-reset { background-color: #6366f1; color: white; }
+.btn-batch-delete { background-color: #ef4444; color: white; }
+
+.queue-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding-right: 2px;
+  flex: 1;
+}
+
+.queue-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.group-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 8px;
+  background-color: #f1f5f9;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: bold;
+  margin-bottom: 4px;
+  color: #334155;
+  user-select: none;
+}
+
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.collapse-icon {
+  font-size: 0.6rem;
+  color: #64748b;
+}
+
+.group-count {
+  font-size: 0.7rem;
+  color: #64748b;
+  font-weight: normal;
+}
+
+.checkbox-wrapper {
+  margin-right: 4px;
+  display: flex;
+  align-items: center;
+}
+
+/* ==========================================
+   6. Modal 彈窗樣式
+   ========================================== */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: rgba(15, 23, 42, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+.modal-card {
+  background: #ffffff;
+  border-radius: 14px;
+  width: 100%;
+  max-width: 440px;
+  padding: 18px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+  max-height: 90vh;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 6px;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  color: #0f172a;
+}
+
+.btn-close {
+  border: none;
+  background: transparent;
+  font-size: 1rem;
+  color: #94a3b8;
+  cursor: pointer;
+}
+
+.modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.form-group label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #334155;
+}
+
+.hint-text {
+  font-size: 0.7rem;
+  color: #64748b;
+}
+
+.form-input, .form-select {
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  outline: none;
+  background-color: #fff;
+}
+
+.modal-footer {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.btn-cancel, .btn-save {
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.825rem;
+}
+
+.btn-cancel {
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+}
+
+.btn-save {
+  background: #2563eb;
+  color: white;
+  border: none;
+}
+
+/* ==========================================
+   7. 精準響應式斷點 (Responsive Breakpoints)
+   ========================================== */
+
+/* --- 中小型螢幕 / 直立平板 (螢幕寬度 < 768px 時才切換成上下排列) --- */
+@media (max-width: 767px) {
+  .app-content-wrapper {
+    grid-template-columns: 1fr; /* 單欄上下排列 */
+    gap: 14px;
   }
 
+  .courts-section {
+    max-height: none; /* 場地自然展開 */
+    overflow-y: visible;
+  }
+
+  .queue-section {
+    position: static;
+    max-height: 450px; /* 直立小螢幕時限制佇列高度，允許內部滾動 */
+  }
+
+  .courts-grid {
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  }
+}
+
+/* --- 手機極小螢幕 (Mobile: < 500px) --- */
+@media (max-width: 499px) {
   .app-header {
-    height: 60px;
-    background: white;
-    padding: 0 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-    display: flex;
-    align-items: center;
-    z-index: 10;
-  }
-
-  .header-content {
-    width: 100%;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-  .header-controls {
-    display: flex;
-    align-items: center;
-    gap: 12px;
+    padding: 8px 10px;
   }
 
   .app-title {
-    font-size: 1.2rem;
-    font-weight: 700;
-    margin: 0;
-    color: #2c3e50;
+    font-size: 1.05rem;
   }
 
-  .btn-add-player, .btn-auto-assign, .btn-clear-courts {
-    border: none;
-    padding: 6px 14px;
-    border-radius: 6px;
-    font-size: 0.88rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    color: white;
+  .header-top-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
   }
 
-  .btn-add-player {
-    background: #52c41a;
-    box-shadow: 0 2px 6px rgba(82, 196, 26, 0.3);
+  .session-filter-bar {
+    width: 100%;
+    overflow-x: auto;
   }
 
-    .btn-add-player:hover {
-      background-color: #73d13d;
-      transform: translateY(-1px);
-    }
-
-  .btn-auto-assign {
-    background: linear-gradient(135deg, #722ed1, #1890ff);
-    box-shadow: 0 2px 6px rgba(114, 46, 209, 0.3);
+  .header-controls {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
   }
-
-    .btn-auto-assign:hover {
-      opacity: 0.9;
-      transform: translateY(-1px);
-    }
-
-  .btn-clear-courts {
-    background: #ff4d4f;
-    box-shadow: 0 2px 6px rgba(255, 77, 79, 0.3);
-  }
-
-    .btn-clear-courts:hover {
-      background-color: #ff7875;
-      transform: translateY(-1px);
-    }
 
   .court-selector {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.9rem;
-  }
-
-    .court-selector select {
-      padding: 4px 8px;
-      border-radius: 4px;
-      border: 1px solid #ccc;
-    }
-
-  .app-content-wrapper {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    padding: 10px;
-    gap: 10px;
-  }
-
-  .courts-section, .queue-section {
-    background: white;
-    border-radius: 10px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.04);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .courts-grid, .queue-container {
-    flex: 1;
-    overflow-y: auto;
-    padding: 10px;
-    -webkit-overflow-scrolling: touch;
-  }
-
-  .queue-container {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .queue-group {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .group-header {
-    display: flex;
+    grid-column: 1 / -1;
+    margin-left: 0;
     justify-content: space-between;
-    align-items: center;
-    font-size: 0.85rem;
-    font-weight: bold;
-    color: #1d39c4;
-    background-color: #f0f5ff;
-    padding: 6px 10px;
-    border-radius: 6px;
-    border-left: 4px solid #2f54eb;
-    cursor: pointer;
-    user-select: none;
-    transition: background-color 0.2s;
   }
-
-    .group-header:hover {
-      background-color: #d6e4ff;
-    }
-
-  .group-title {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .collapse-icon {
-    font-size: 0.7rem;
-    color: #2f54eb;
-  }
-
-  .group-count {
-    font-size: 0.75rem;
-    color: #8c8c8c;
-    background: rgba(255, 255, 255, 0.8);
-    padding: 1px 6px;
-    border-radius: 10px;
-  }
-
-  @media (min-width: 769px) {
-    .app-content-wrapper {
-      flex-direction: row;
-    }
-
-    .courts-section {
-      flex: 3;
-    }
-
-    .queue-section {
-      flex: 1;
-      min-width: 320px;
-    }
-  }
-
-  .section-header {
-    padding: 10px 15px;
-    border-bottom: 1px solid #eee;
-    background-color: #fafafa;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-    .section-header h2 {
-      font-size: 1rem;
-      margin: 0;
-      font-weight: 600;
-      color: #555;
-    }
-
-  .header-tip {
-    font-size: 0.75rem;
-    color: #888;
-  }
-
-  .header-title-group {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    width: 100%;
-  }
-
-  .btn-toggle-batch {
-    background: #ffffff;
-    border: 1px solid #d9d9d9;
-    padding: 3px 8px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: #595959;
-  }
-
-    .btn-toggle-batch.active {
-      background: #1890ff;
-      color: white;
-      border-color: #1890ff;
-    }
-
-  .batch-actions-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #e6f7ff;
-    padding: 6px 10px;
-    border-radius: 6px;
-    border: 1px solid #91d5ff;
-  }
-
-  .btn-batch-select-all {
-    background: white;
-    border: 1px solid #91d5ff;
-    color: #1890ff;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    cursor: pointer;
-  }
-
-  .selected-count {
-    font-size: 0.8rem;
-    color: #1890ff;
-    font-weight: bold;
-  }
-
-  .batch-btns {
-    margin-left: auto;
-    display: flex;
-    gap: 6px;
-  }
-
-  .btn-batch-rest, .btn-batch-active, .btn-batch-delete {
-    color: white;
-    border: none;
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    font-weight: bold;
-    cursor: pointer;
-  }
-
-  .btn-batch-rest {
-    background: #fa8c16;
-  }
-
-  .btn-batch-active {
-    background: #52c41a;
-  }
-
-  .btn-batch-delete {
-    background: #ff4d4f;
-  }
-
-    .btn-batch-rest:disabled, .btn-batch-active:disabled, .btn-batch-delete:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
 
   .courts-grid {
-    flex: 1;
-    display: flex;
-    flex-wrap: wrap;
-    align-content: stretch; /* 讓多行時高度自動拉伸 */
-    gap: 10px;
+    grid-template-columns: 1fr; /* 手機上單欄滿頁 */
+  }
+
+  .setup-container {
     padding: 10px;
-    overflow-y: auto;
-    -webkit-overflow-scrolling: touch;
   }
-
-  .court-card {
-    flex: 1 1 calc(33.333% - 10px); /* 預設一排約 3 個，可依剩餘空間伸縮 */
-    min-width: 260px;
-    background: #fdfdfd;
-    border: 2px solid #e0e0e0;
-    border-radius: 8px;
-    padding: 10px;
-    box-sizing: border-box;
-    /* 垂直彈性佈局，內部元件均勻分佈 */
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-  }
-
-    .court-card.playing {
-      border-color: #52c41a;
-      background-color: #f6ffed;
-    }
-
-  /* 少量場地時自動放大填滿 (僅 1 個場地時佔滿 100%) */
-  .courts-grid:has(.court-card:nth-last-child(1):first-child) .court-card {
-    flex: 1 1 100%;
-  }
-
-  /* 僅 2 個場地時各佔 50% */
-  .courts-grid:has(.court-card:nth-last-child(2):first-child) .court-card,
-  .courts-grid:has(.court-card:nth-last-child(2):first-child) ~ .court-card {
-    flex: 1 1 calc(50% - 10px);
-  }
-
-  .court-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 8px;
-    padding-bottom: 5px;
-    border-bottom: 1px dashed #ddd;
-  }
-
-  .court-header-right, .title-with-status {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .court-header h3 {
-    margin: 0;
-    font-size: 1rem;
-  }
-
-  .status-badge {
-    font-size: 0.7rem;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: #eee;
-    color: #666;
-  }
-
-    .status-badge.playing {
-      background: #52c41a;
-      color: white;
-    }
-
-  .match-timer {
-    font-size: 0.8rem;
-    font-weight: bold;
-    color: #cf1322;
-    background: #fff1f0;
-    padding: 2px 6px;
-    border-radius: 4px;
-    border: 1px solid #ffa39e;
-  }
-
-  .player-count {
-    font-size: 0.8rem;
-    color: #666;
-    background: #eee;
-    padding: 2px 6px;
-    border-radius: 10px;
-  }
-
-    .player-count.full {
-      background-color: #1890ff;
-      color: white;
-    }
-
-  .zone-label {
-    font-size: 0.75rem;
-    font-weight: bold;
-    color: #1890ff;
-    margin: 6px 0 2px 2px;
-  }
-
-  .next-zone-label {
-    color: #fa8c16;
-    margin-top: 10px;
-  }
-
-  .court-player-list {
-    min-height: 80px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .court-actions {
-    margin-top: 10px;
-  }
-
-  .btn-start-match, .btn-finish-match {
-    width: 100%;
-    padding: 8px;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.9rem;
-    font-weight: 600;
-  }
-
-  .btn-start-match {
-    background-color: #1890ff;
-  }
-
-  .btn-finish-match {
-    background-color: #ff4d4f;
-  }
-
-  .queue-player-list {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    min-height: 45px;
-  }
-
-  .player-list {
-    background-color: #fafafa;
-    border: 2px dashed #ddd;
-    border-radius: 6px;
-    padding: 5px;
-  }
-
-  .player-card {
-    padding: 8px 12px;
-    background: white;
-    border: 1px solid #ddd;
-    border-left: 4px solid #1890ff;
-    border-radius: 4px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    cursor: grab;
-    user-select: none;
-    touch-action: none;
-  }
-
-    .player-card.clickable:hover {
-      background-color: #e6f7ff;
-      border-color: #91d5ff;
-    }
-
-    .player-card.is-selected {
-      border: 2px solid #1890ff !important;
-      background-color: #e6f7ff !important;
-    }
-
-    .player-card.is-resting {
-      background-color: #f5f5f5;
-      opacity: 0.6;
-      border-left-color: #d9d9d9;
-    }
-
-  .checkbox-wrapper {
-    margin-right: 8px;
-  }
-
-  .ghost {
-    opacity: 0.4;
-    background: #c8ebfb;
-  }
-
-  .player-info {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex: 1;
-    min-width: 0; /* 允許長文字區域正常防護縮放 */
-  }
-
-  .player-stats, .player-actions-right {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0; /* 防止右側標籤與按鈕被壓縮 */
-  }
-
-  .player-name {
-    max-width: 100px;
-    word-break: break-all;
-    white-space: normal;
-    line-height: 1.25;
-  }
-
-  .player-gender {
-    font-size: 0.8rem;
-    font-weight: bold;
-    flex-shrink: 0;
-  }
-
-  .male {
-    color: #1890ff;
-  }
-
-  .female {
-    color: #f5222d;
-  }
-
-  .played-tag {
-    font-size: 0.75rem;
-    color: #888;
-    background: #eee;
-    padding: 1px 5px;
-    border-radius: 4px;
-  }
-
-  .resting-badge {
-    font-size: 0.7rem;
-    background-color: #ff4d4f;
-    color: white;
-    padding: 1px 5px;
-    border-radius: 4px;
-  }
-
-  .btn-quick-add {
-    background-color: #52c41a;
-    color: white;
-    border: none;
-    border-radius: 50%;
-    width: 26px;
-    height: 26px;
-    font-size: 0.85rem;
-    cursor: pointer;
-  }
-
-  .level-tag {
-    font-size: 0.75rem;
-    padding: 1px 6px;
-    border-radius: 4px;
-    color: white;
-    font-weight: bold;
-  }
-
-  .level-1, .level-2, .level-3, .level-4, .level-5 {
-    background-color: #52c41a;
-  }
-
-  .level-6, .level-7, .level-8, .level-9, .level-10 {
-    background-color: #fa8c16;
-  }
-
-  .level-11, .level-12, .level-13, .level-14, .level-15 {
-    background-color: #f5222d;
-  }
-
-  .modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    background-color: rgba(0, 0, 0, 0.45);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 1000;
-  }
-
-  .modal-card {
-    background: white;
-    width: 90%;
-    max-width: 380px;
-    border-radius: 12px;
-    overflow: hidden;
-  }
-
-  .modal-header {
-    padding: 12px 16px;
-    background-color: #fafafa;
-    border-bottom: 1px solid #eee;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-    .modal-header h3 {
-      margin: 0;
-      font-size: 1.05rem;
-    }
-
-  .btn-close {
-    background: none;
-    border: none;
-    font-size: 1.1rem;
-    cursor: pointer;
-    color: #999;
-  }
-
-  .modal-body {
-    padding: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .form-group {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-    .form-group label {
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: #666;
-    }
-
-  .form-input, .form-select {
-    padding: 8px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    font-size: 0.95rem;
-  }
-
-  .modal-footer {
-    padding: 12px 16px;
-    border-top: 1px solid #eee;
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    background-color: #fafafa;
-  }
-
-  .btn-cancel {
-    padding: 6px 12px;
-    background-color: #f5f5f5;
-    border: 1px solid #d9d9d9;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .btn-save {
-    padding: 6px 14px;
-    background-color: #1890ff;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    font-weight: 600;
-  }
-
-  .group-mode-switch {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-top: 4px;
-  }
-
-  .switch-label {
-    font-size: 0.75rem;
-    color: #666;
-  }
-
-  .btn-mode-tab {
-    background: #f0f0f0;
-    border: 1px solid #d9d9d9;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    cursor: pointer;
-    color: #595959;
-    transition: all 0.2s;
-  }
-
-    .btn-mode-tab.active {
-      background: #722ed1;
-      color: white;
-      border-color: #722ed1;
-      font-weight: bold;
-    }
+}
 </style>

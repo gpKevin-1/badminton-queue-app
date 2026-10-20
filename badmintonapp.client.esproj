@@ -1,11 +1,12 @@
 <Project Sdk="Microsoft.VisualStudio.JavaScript.Sdk/1.0.5581896">
-  <PropertyGroup>
-    <StartupCommand>npm run dev</StartupCommand>
-    <JavaScriptTestRoot>.\</JavaScriptTestRoot>
-    <JavaScriptTestFramework>Vitest</JavaScriptTestFramework>
-    <!-- Allows the build (or compile) script located on package.json to run on Build -->
-    <ShouldRunBuildScript>false</ShouldRunBuildScript>
-    <!-- Folder where production build objects will be placed -->
-    <BuildOutputFolder>$(MSBuildProjectDirectory)\dist</BuildOutputFolder>
-  </PropertyGroup>
+	<PropertyGroup>
+		<StartupCommand>npm run dev</StartupCommand>
+		<JavaScriptTestRoot>.\</JavaScriptTestRoot>
+		<JavaScriptTestFramework>Vitest</JavaScriptTestFramework>
+		<!-- 關閉自動執行 npm install 與 建置腳本，避免 VS 背景安裝失敗爆錯 -->
+		<ShouldRunNpmInstall>false</ShouldRunNpmInstall>
+		<ShouldRunBuildScript>false</ShouldRunBuildScript>
+		<!-- Folder where production build objects will be placed -->
+		<BuildOutputFolder>$(MSBuildProjectDirectory)\dist</BuildOutputFolder>
+	</PropertyGroup>
 </Project>
