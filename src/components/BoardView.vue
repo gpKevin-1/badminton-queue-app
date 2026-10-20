@@ -37,7 +37,8 @@ export interface Court {
 export interface SessionConfig {
   courtCount: number;
   maxPlayersCount: number;
-  maxGamesPerPlayer: number;
+  maxGamesPerPlayer: number; // 預設/備用上限
+  slotMaxGames: Record<string, number>; // ⏰ 每個時段各自的每人最多打場數設定
   timeSlots: string[];      // 今日開啟的時段列表
 }
 
@@ -58,14 +59,18 @@ const STORAGE_KEY_PLAYERS = 'badminton_queue_players_data';
 const STORAGE_KEY_CONFIG = 'badminton_queue_config_data';
 const STORAGE_KEY_HISTORY = 'badminton_queue_history_data';
 
-const DEFAULT_TIME_SLOTS = ['18:00-20:00', '20:00-22:00'];
+const DEFAULT_TIME_SLOTS = ['19:30-22:30', '22:30-23:30'];
 
 const currentView = ref<'setup' | 'board'>('setup');
 
 const sessionConfig = ref<SessionConfig>({
   courtCount: 3,
   maxPlayersCount: 30,
-  maxGamesPerPlayer: 4,
+  maxGamesPerPlayer: 6,
+  slotMaxGames: {
+    '19:30-22:30': 6,
+    '22:30-23:30': 2
+  },
   timeSlots: [...DEFAULT_TIME_SLOTS]
 });
 
@@ -101,7 +106,7 @@ const newPlayer = ref<Omit<Player, 'id'>>({
   playedCount: 0,
   level: '5',
   status: '1',
-  sessions: [],
+  sessions: [...DEFAULT_TIME_SLOTS],
   partnerId: null,
   avoidIds: []
 });
@@ -120,11 +125,17 @@ const collapsedGroups = ref<Record<string, boolean>>({
 
 const courts = ref<Court[]>([]);
 
-// --- 動態上限與限制邏輯 ---
+// --- 動態上限與限制邏輯（累加該選手報名各時段的場數上限） ---
 const getPlayerMaxGames = (player: Player): number => {
-  const baseMax = sessionConfig.value.maxGamesPerPlayer || 4;
-  const sessionCount = player.sessions && player.sessions.length > 0 ? player.sessions.length : 1;
-  return baseMax * sessionCount;
+  if (!player.sessions || player.sessions.length === 0) {
+    return sessionConfig.value.maxGamesPerPlayer || 6;
+  }
+  let totalMax = 0;
+  player.sessions.forEach(slot => {
+    const slotLimit = sessionConfig.value.slotMaxGames?.[slot] ?? sessionConfig.value.maxGamesPerPlayer ?? 6;
+    totalMax += slotLimit;
+  });
+  return totalMax;
 };
 
 const isPlayerLimitReached = (player: Player): boolean => {
@@ -176,6 +187,13 @@ const addTimeSlot = () => {
   sessionConfig.value.timeSlots.push(val);
   sessionConfig.value.timeSlots.sort((a, b) => parseTimeSlot(a) - parseTimeSlot(b));
   
+  if (!sessionConfig.value.slotMaxGames) {
+    sessionConfig.value.slotMaxGames = {};
+  }
+  if (sessionConfig.value.slotMaxGames[val] === undefined) {
+    sessionConfig.value.slotMaxGames[val] = sessionConfig.value.maxGamesPerPlayer || 4;
+  }
+
   if (!batchDefaultSessions.value.includes(val)) {
     batchDefaultSessions.value.push(val);
   }
@@ -185,10 +203,17 @@ const addTimeSlot = () => {
 const removeTimeSlot = (index: number) => {
   const removed = sessionConfig.value.timeSlots.splice(index, 1)[0];
   batchDefaultSessions.value = batchDefaultSessions.value.filter(s => s !== removed);
+  if (sessionConfig.value.slotMaxGames && sessionConfig.value.slotMaxGames[removed] !== undefined) {
+    delete sessionConfig.value.slotMaxGames[removed];
+  }
 };
 
 const resetTimeSlotsToDefault = () => {
   sessionConfig.value.timeSlots = [...DEFAULT_TIME_SLOTS];
+  sessionConfig.value.slotMaxGames = {
+    '19:30-22:30': 6,
+    '22:30-23:30': 2
+  };
   batchDefaultSessions.value = [...DEFAULT_TIME_SLOTS];
 };
 
@@ -230,7 +255,11 @@ const loadFromLocalStorage = () => {
 
       sessionConfig.value = {
         ...parsed,
-        timeSlots: loadedSlots
+        timeSlots: loadedSlots,
+        slotMaxGames: parsed.slotMaxGames || {
+          '19:30-22:30': 6,
+          '22:30-23:30': 2
+        }
       };
       batchDefaultSessions.value = [...sessionConfig.value.timeSlots];
     } catch (e) {
@@ -267,8 +296,8 @@ const loadFromLocalStorage = () => {
     const defaultSlots = sessionConfig.value.timeSlots;
     queuePlayers.value = [
       { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1', sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
-      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
-      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '19:30-22:30'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '22:30-23:30'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
       { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] }
     ];
   }
@@ -451,7 +480,6 @@ const handleFileUpload = (event: Event) => {
 const startSession = () => {
   if (sessionConfig.value.courtCount < 1) return alert('請至少設定 1 個場地！');
   if (sessionConfig.value.maxPlayersCount < 1) return alert('請設定有效的總人數上限！');
-  if (sessionConfig.value.maxGamesPerPlayer < 1) return alert('每人最多打場數必須至少為 1 場！');
   if (sessionConfig.value.timeSlots.length === 0) return alert('請至少設定一個今日開場時段！');
 
   initCourts(sessionConfig.value.courtCount);
@@ -1077,7 +1105,7 @@ const getGenderText = (gender: string) => {
         <div class="setup-card">
           <div class="setup-header">
             <h2>🏸 1. 今日開場參數設定</h2>
-            <p>設定場地數、預計總人數、個人單時段上限與開放時段</p>
+            <p>設定場地數、預計總人數、各時段打場上限與開放時段</p>
           </div>
 
           <div class="setup-form">
@@ -1098,27 +1126,25 @@ const getGenderText = (gender: string) => {
             </div>
 
             <div class="form-item">
-              <label for="setupMaxGames">🎾 單一時段最多打幾場：</label>
-              <div class="input-with-unit">
-                <input id="setupMaxGames" type="number" min="1" max="20" v-model.number="sessionConfig.maxGamesPerPlayer" class="setup-input" />
-                <span>場/時段</span>
-              </div>
-              <small class="hint-text">💡 報名 2 個時段的選手，總上限將自動倍增。</small>
-            </div>
-
-            <div class="form-item">
               <div class="slot-label-row">
-                <label>⏰ 今日開放時段：</label>
-                <button class="btn-reset-slots" @click="resetTimeSlotsToDefault" title="歸為預設開場時段">🔄 恢復預設時段</button>
+                <label>⏰ 今日開放時段與各時段每人場數上限：</label>
+                <button class="btn-reset-slots" @click="resetTimeSlotsToDefault" title="歸為預設時段與上限">🔄 恢復預設時段</button>
               </div>
-              <div class="slots-editor">
-                <div v-for="(slot, idx) in sessionConfig.timeSlots" :key="idx" class="slot-tag">
-                  <span>{{ slot }}</span>
-                  <button class="btn-remove-slot" @click="removeTimeSlot(idx)">✕</button>
+              
+              <div class="slots-config-list">
+                <div v-for="(slot, idx) in sessionConfig.timeSlots" :key="slot" class="slot-config-item">
+                  <span class="slot-tag-text">{{ slot }}</span>
+                  <div class="slot-limit-input-wrap">
+                    <span>上限:</span>
+                    <input type="number" min="1" max="20" v-model.number="sessionConfig.slotMaxGames[slot]" class="setup-input small-input" />
+                    <span>場</span>
+                  </div>
+                  <button class="btn-remove-slot" @click="removeTimeSlot(idx)" title="刪除時段">✕</button>
                 </div>
               </div>
-              <div class="add-slot-row">
-                <input type="text" v-model="newSlotInput" placeholder="例: 18:00-20:00" class="setup-input small-input" @keyup.enter="addTimeSlot" />
+
+              <div class="add-slot-row" style="margin-top: 8px;">
+                <input type="text" v-model="newSlotInput" placeholder="例: 22:30-23:30" class="setup-input small-input" @keyup.enter="addTimeSlot" />
                 <button class="btn-add-slot" @click="addTimeSlot">➕ 新增時段</button>
               </div>
             </div>
@@ -1404,13 +1430,16 @@ const getGenderText = (gender: string) => {
                       <span v-else-if="isPlayerLimitReached(player)" class="completed-badge">🏁 完賽</span>
                     </div>
 
-                    <!-- ⏳ 顯示等待時間與上局夥伴資訊 -->
+                    <!-- ⏳ 顯示等待時間、上局夥伴與個人報名時段資訊 -->
                     <div class="player-extra-meta">
                       <span class="wait-time-badge" :class="{ 'warning-wait': getWaitSeconds(player) > 900 }">
                         ⏳ 等待: {{ formatWaitTime(getWaitSeconds(player)) }}
                       </span>
                       <span v-if="player.lastMatchPeers && player.lastMatchPeers.length > 0" class="last-peers-badge" :title="'上局同場: ' + player.lastMatchPeers.join(', ')">
                         👥 上局: {{ player.lastMatchPeers.join(', ') }}
+                      </span>
+                      <span v-if="player.sessions && player.sessions.length > 0" class="session-tags-badge" :title="'報名時段: ' + player.sessions.join(', ')">
+                        ⏰ {{ player.sessions.join(' / ') }}
                       </span>
                     </div>
                   </div>
@@ -1465,7 +1494,7 @@ const getGenderText = (gender: string) => {
         </div>
       </div>
 
-      <!-- Modal: 編輯選手 (含錯開設定與搭檔綁定) -->
+      <!-- Modal: 編輯選手 (含時段、錯開設定與搭檔綁定) -->
       <div v-if="isEditModalOpen && editingPlayer" class="modal-overlay" @click.self="closeEditModal">
         <div class="modal-card">
           <div class="modal-header">
@@ -1476,6 +1505,17 @@ const getGenderText = (gender: string) => {
             <div class="form-group">
               <label>姓名：</label>
               <input type="text" v-model="editingPlayer.name" class="form-input" />
+            </div>
+
+            <!-- ⏰ 選手報名時段設定 -->
+            <div class="form-group">
+              <label>⏰ 報名時段 (可複選)：</label>
+              <div class="checkbox-group">
+                <label v-for="slot in sessionConfig.timeSlots" :key="slot" class="checkbox-item">
+                  <input type="checkbox" :value="slot" v-model="editingPlayer.sessions" />
+                  <span>{{ slot }} (上限: {{ sessionConfig.slotMaxGames?.[slot] ?? 4 }}場)</span>
+                </label>
+              </div>
             </div>
             
             <div class="form-group">
@@ -1598,11 +1638,13 @@ const getGenderText = (gender: string) => {
 .setup-actions { margin-top: 16px; padding-top: 12px; }
 .btn-start-session { width: 100%; padding: 12px; background-color: #2563eb; color: #ffffff; font-size: 0.95rem; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; }
 
-.slots-editor { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
-.slot-tag { display: flex; align-items: center; gap: 4px; background-color: #e0f2fe; color: #0369a1; padding: 4px 10px; border-radius: 12px; font-size: 0.8rem; font-weight: 600; }
-.btn-remove-slot { border: none; background: transparent; color: #0284c7; cursor: pointer; font-size: 0.85rem; }
+.slots-config-list { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.slot-config-item { display: flex; align-items: center; justify-content: space-between; background: #f8fafc; border: 1px solid #e2e8f0; padding: 6px 10px; border-radius: 8px; gap: 8px; }
+.slot-tag-text { font-weight: 600; font-size: 0.85rem; color: #0369a1; }
+.slot-limit-input-wrap { display: flex; align-items: center; gap: 4px; font-size: 0.8rem; color: #64748b; }
+.btn-remove-slot { border: none; background: transparent; color: #ef4444; cursor: pointer; font-size: 0.9rem; font-weight: bold; }
 .add-slot-row { display: flex; gap: 8px; }
-.small-input { max-width: 160px; }
+.small-input { max-width: 130px; text-align: center; }
 .btn-add-slot { padding: 6px 12px; background-color: #0284c7; color: white; border: none; border-radius: 6px; font-size: 0.8rem; cursor: pointer; }
 
 .batch-defaults { display: flex; gap: 16px; background-color: #f8fafc; padding: 8px 12px; border-radius: 6px; margin: 12px 0; border: 1px solid #e2e8f0; flex-wrap: wrap; }
@@ -1694,6 +1736,7 @@ const getGenderText = (gender: string) => {
 .wait-time-badge { font-size: 0.65rem; background-color: #f1f5f9; color: #475569; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
 .wait-time-badge.warning-wait { background-color: #fee2e2; color: #dc2626; }
 .last-peers-badge { font-size: 0.65rem; background-color: #f3e8ff; color: #7e22ce; padding: 1px 5px; border-radius: 4px; }
+.session-tags-badge { font-size: 0.65rem; background-color: #e0f2fe; color: #0369a1; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
 
 .partner-badge { font-size: 0.65rem; background-color: #fef3c7; color: #92400e; padding: 1px 4px; border-radius: 4px; }
 .resting-badge { font-size: 0.65rem; background-color: #fef3c7; color: #b45309; padding: 1px 4px; border-radius: 4px; }
