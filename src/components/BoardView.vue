@@ -51,7 +51,7 @@ const STORAGE_KEY_CONFIG = 'badminton_queue_config_data';
 const DEFAULT_TIME_SLOTS = ['18:00-20:00', '20:00-22:00'];
 
 // 視圖切換：'setup' (開場設定) | 'board' (看板主畫面)
-const currentView = ref<'setup' | 'board'>('board');
+const currentView = ref<'setup' | 'board'>('setup');
 
 // 今日活動開場設定
 const sessionConfig = ref<SessionConfig>({
@@ -952,7 +952,7 @@ const dragOptions = computed(() => ({
   // 增加下面這幾行設定，能大幅改善行動裝置上的拖曳流暢度
   delay: 0,                 // 移除觸控延遲（或設為 50~100ms 避免跟點擊衝突）
   touchStartThreshold: 5,   // 手指滑動超過 5px 才正式觸發拖曳，避免輕觸時卡住
-  forceFallback: true,      // 啟用強制降級渲染（使用模擬的拖曳圖層，解決部分 iOS/Android 原生拖曳 API 閃爍或失效的問題）
+  forceFallback: true,      // 啟用強制降級渲染（解決部分 iOS/Android 原生拖曳 API 閃爍或失效的問題）
   fallbackClass: "sortable-fallback"
 }));
 
@@ -970,7 +970,7 @@ const getGenderText = (gender: string) => {
 
 <template>
   <div class="app-main-layout">
-    <!-- 畫面 1: 今日開場參數與批次報名設定 -->
+    <!-- 畫面 1: 今日開場參數與批次報名設定 (改為左/中/右 三欄佈局) -->
     <div v-if="currentView === 'setup'" class="setup-container">
       <div class="setup-grid">
         <!-- 左側：活動參數設定 -->
@@ -1030,7 +1030,7 @@ const getGenderText = (gender: string) => {
           </div>
         </div>
 
-        <!-- 右側：批次報名匯入工具 -->
+        <!-- 中間：批次報名匯入工具 -->
         <div class="setup-card">
           <div class="setup-header">
             <h2>📋 2. 選手批次報名</h2>
@@ -1066,7 +1066,7 @@ const getGenderText = (gender: string) => {
           </div>
 
           <!-- 方式 1: 貼上多行名單 -->
-          <div class="form-item">
+          <div class="form-item" style="margin-top: 10px;">
             <label>快速貼上名單（每行一位，支援包含等級/性別/時段）：</label>
             <textarea 
               v-model="batchText" 
@@ -1091,14 +1091,14 @@ const getGenderText = (gender: string) => {
           </div>
         </div>
 
-        <!-- 下方：目前已報名名單預覽區 -->
-        <div class="setup-card full-width">
+        <!-- 右側：目前已報名名單預覽區 (三欄佈局) -->
+        <div class="setup-card preview-card">
           <div class="setup-header preview-header">
-            <h3>👥 目前已報名選手名單 ({{ queuePlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
-            <button class="btn-clear-all" @click="clearAllPlayersInSetup" v-if="queuePlayers.length > 0">🗑 清空名單</button>
+            <h3>👥 已報名選手名單 ({{ queuePlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
+            <button class="btn-clear-all" @click="clearAllPlayersInSetup" v-if="queuePlayers.length > 0">🗑 清空</button>
           </div>
 
-          <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用上方批次報名工具。</div>
+          <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用左側批次報名工具。</div>
           <div v-else class="preview-player-tags">
             <div v-for="p in queuePlayers" :key="p.id" class="preview-tag">
               <span v-if="getGenderText(p.gender)" class="p-gender" :class="p.gender === 'M' ? 'male' : 'female'">{{ getGenderText(p.gender) }}</span>
@@ -1388,7 +1388,7 @@ const getGenderText = (gender: string) => {
               <input type="text" v-model="editingPlayer.name" class="form-input" />
             </div>
             
-            <!-- 新增：綁定搭檔選擇欄位 -->
+            <!-- 綁定搭檔選擇欄位 -->
             <div class="form-group">
               <label>👥 綁定搭檔 (一起上場)：</label>
               <select v-model="editingPlayer.partnerId" class="form-select">
@@ -1471,20 +1471,21 @@ const getGenderText = (gender: string) => {
 }
 
 /* ==========================================
-   2. 畫面 1: 開場設定頁面 (Setup View)
+   2. 畫面 1: 開場設定頁面 (Setup View - 三欄式佈局)
    ========================================== */
 .setup-container {
   display: flex;
   justify-content: center;
   padding: 24px 20px;
-  max-width: 1100px;
+  max-width: 1440px;
   margin: 0 auto;
   box-sizing: border-box;
 }
 
 .setup-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  /* 寬螢幕下固定分成左、中、右 3 欄 */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 20px;
   width: 100%;
 }
@@ -1499,8 +1500,10 @@ const getGenderText = (gender: string) => {
   border: 1px solid #e2e8f0;
 }
 
-.setup-card.full-width {
-  grid-column: 1 / -1;
+.preview-card {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 80px);
 }
 
 .setup-header h2, .setup-header h3 {
@@ -1724,6 +1727,7 @@ const getGenderText = (gender: string) => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  margin-bottom: 8px;
 }
 
 .btn-clear-all {
@@ -1736,29 +1740,42 @@ const getGenderText = (gender: string) => {
   cursor: pointer;
 }
 
+.empty-tip {
+  font-size: 0.85rem;
+  color: #94a3b8;
+  padding: 12px 0;
+}
+
 .preview-player-tags {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 8px;
-  max-height: 160px;
+  flex: 1;
   overflow-y: auto;
-  padding: 10px;
+  padding: 8px;
   background-color: #f8fafc;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   margin-top: 8px;
+  max-height: 520px;
 }
 
 .preview-tag {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
   background-color: #ffffff;
   border: 1px solid #cbd5e1;
-  padding: 4px 10px;
-  border-radius: 16px;
-  font-size: 0.8rem;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 0.825rem;
 }
+
+.p-gender { font-weight: bold; }
+.p-gender.male { color: #2563eb; }
+.p-gender.female { color: #ec4899; }
+.p-name { font-weight: 600; flex: 1; margin: 0 6px; color: #1e293b; }
+.p-level { color: #475569; font-size: 0.75rem; background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
 
 .p-partner {
   font-size: 0.72rem;
@@ -1766,6 +1783,13 @@ const getGenderText = (gender: string) => {
   color: #92400e;
   padding: 1px 6px;
   border-radius: 4px;
+  margin-left: 4px;
+}
+
+.p-sessions {
+  font-size: 0.72rem;
+  color: #0284c7;
+  margin-left: 4px;
 }
 
 .btn-remove-tag {
@@ -1773,6 +1797,12 @@ const getGenderText = (gender: string) => {
   background: transparent;
   color: #94a3b8;
   cursor: pointer;
+  font-weight: bold;
+  padding: 0 4px;
+}
+
+.btn-remove-tag:hover {
+  color: #ef4444;
 }
 
 /* ==========================================
@@ -1918,14 +1948,13 @@ const getGenderText = (gender: string) => {
 }
 
 /* ==========================================
-   4. 主看板區域 (核心 雙欄 / 上下 彈性 Grid 佈局)
+   4. 主看板區域 (雙欄 / 上下 彈性 Grid 佈局)
    ========================================== */
 .app-content-wrapper {
   max-width: 1600px;
   margin: 12px auto 0 auto;
   padding: 0 12px 12px 12px;
   display: grid;
-  /* 預設雙欄：左側自動彈性適應，右側固定 320px 佇列 */
   grid-template-columns: minmax(0, 1fr) 320px;
   gap: 16px;
   align-items: start;
@@ -1937,10 +1966,10 @@ const getGenderText = (gender: string) => {
   display: flex;
   flex-direction: column;
   width: 100%;
-  min-width: 0; /* 避免 flex/grid 子項擠壓爆開 */
+  min-width: 0;
   max-height: calc(100vh - 120px);
   max-height: calc(100dvh - 120px);
-  overflow-y: auto; /* 獨立往下捲動 */
+  overflow-y: auto;
   padding-right: 4px;
 }
 
@@ -1959,7 +1988,7 @@ const getGenderText = (gender: string) => {
   max-height: calc(100dvh - 120px);
   position: sticky;
   top: 80px;
-  overflow-y: auto; /* 獨立垂直捲動 */
+  overflow-y: auto;
 }
 
 .section-header {
@@ -1989,7 +2018,6 @@ const getGenderText = (gender: string) => {
 
 .courts-grid {
   display: grid;
-  /* 自適應最小 250px 場地寬度，空間夠會自動併排 */
   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
   gap: 12px;
   align-items: stretch;
@@ -2510,21 +2538,35 @@ const getGenderText = (gender: string) => {
    7. 精準響應式斷點 (Responsive Breakpoints)
    ========================================== */
 
-/* --- 中小型螢幕 / 直立平板 (螢幕寬度 < 768px 時才切換成上下排列) --- */
+/* --- 中型螢幕 (平板/筆電: 768px ~ 1100px 時改為兩欄，名單降為下方滿寬) --- */
+@media (max-width: 1100px) {
+  .setup-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .preview-card {
+    grid-column: 1 / -1;
+    max-height: none;
+  }
+}
+
+/* --- 小型螢幕 / 直立平板 (螢幕寬度 < 768px 時切換成單欄) --- */
 @media (max-width: 767px) {
+  .setup-grid {
+    grid-template-columns: 1fr;
+  }
   .app-content-wrapper {
-    grid-template-columns: 1fr; /* 單欄上下排列 */
+    grid-template-columns: 1fr;
     gap: 14px;
   }
 
   .courts-section {
-    max-height: none; /* 場地自然展開 */
+    max-height: none;
     overflow-y: visible;
   }
 
   .queue-section {
     position: static;
-    max-height: 450px; /* 直立小螢幕時限制佇列高度，允許內部滾動 */
+    max-height: 450px;
   }
 
   .courts-grid {
@@ -2567,14 +2609,13 @@ const getGenderText = (gender: string) => {
   }
 
   .courts-grid {
-    grid-template-columns: 1fr; /* 手機上單欄滿頁 */
+    grid-template-columns: 1fr;
   }
 
   .setup-container {
     padding: 10px;
   }
 
-  /* 讓所有 draggable 容器與卡片都禁用預設的觸控捲動行為 */
   .player-list, .player-card {
     touch-action: none;
   }
