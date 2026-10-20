@@ -56,7 +56,7 @@ const currentView = ref<'setup' | 'board'>('setup');
 // 今日活動開場設定
 const sessionConfig = ref<SessionConfig>({
   courtCount: 3,
-  maxPlayersCount: 20,
+  maxPlayersCount: 30,
   maxGamesPerPlayer: 4,
   timeSlots: [...DEFAULT_TIME_SLOTS]
 });
@@ -67,7 +67,7 @@ const newSlotInput = ref<string>('');
 // 看板時段篩選器：'all' 或特定的時段字串
 const currentSessionFilter = ref<string>('all');
 
-// 依據時間順序自動排序後的時段列表 (供畫面渲染使用)
+// 依據時間順序自動排序後的時段列表
 const sortedTimeSlots = computed(() => {
   return [...sessionConfig.value.timeSlots].sort((a, b) => parseTimeSlot(a) - parseTimeSlot(b));
 });
@@ -217,17 +217,13 @@ const loadFromLocalStorage = () => {
       { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1', sessions: [...defaultSlots], partnerId: null },
       { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: null },
       { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null },
-      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null },
-      { id: 5, name: '李洋', gender: 'M', playedCount: 0, level: '12', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: 6 },
-      { id: 6, name: '王齊麟', gender: 'M', playedCount: 0, level: '12', status: '1', sessions: [defaultSlots[0] || '18:00-20:00'], partnerId: 5 },
-      { id: 7, name: '球友A', gender: '-', playedCount: 1, level: '8', status: '1', sessions: [...defaultSlots], partnerId: null },
-      { id: 8, name: '球友B', gender: '-', playedCount: 0, level: '4', status: '0', sessions: [defaultSlots[1] || '20:00-22:00'], partnerId: null }
+      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null }
     ];
   }
   initCourts(sessionConfig.value.courtCount);
 };
 
-// --- 4. 批次解析與匯入邏輯 ---
+// --- 4. 批次解析與匯入邏輯 (包含 🚺 判斷) ---
 const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, offsetIndex: number): boolean => {
   const cleanName = playerData.name.trim();
   if (!cleanName) return false;
@@ -252,6 +248,7 @@ const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, 
   }
 };
 
+// ⭐ 主要修改處：批次文字名單解析（含 🚺 / 🚹 判斷）
 const parseAndImportText = () => {
   if (!batchText.value.trim()) return alert('請先貼上選手名單！');
 
@@ -264,28 +261,49 @@ const parseAndImportText = () => {
     let cleanLine = line.trim();
     if (!cleanLine) return;
 
-    cleanLine = cleanLine.replace(/^[\d+[\.\)\-\s]+/, '').trim();
+    // 1. 移除開頭的數字編號（例如: "01.", "02. ", "03-", "04 "）
+    cleanLine = cleanLine.replace(/^[\d]+[\.\)\-\s]+/, '').trim();
     if (!cleanLine) return;
-
-    const tokens = cleanLine.split(/[\s,，]+/);
-    const name = tokens[0];
-    if (!name) return;
 
     let gender = batchDefaultGender.value;
     let level = batchDefaultLevel.value;
+
+    // 2. 檢測並辨識 🚺 符號與性別關鍵字
+    if (cleanLine.includes('🚺') || cleanLine.includes('♀')) {
+      gender = 'F';
+      cleanLine = cleanLine.replace(/🚺/g, '').replace(/♀/g, '').trim();
+    } else if (cleanLine.includes('🚹') || cleanLine.includes('♂')) {
+      gender = 'M';
+      cleanLine = cleanLine.replace(/🚹/g, '').replace(/♂/g, '').trim();
+    }
+
+    // 3. 以空格或逗號分割剩餘文字標籤
+    const tokens = cleanLine.split(/[\s,，]+/).filter(Boolean);
+    if (tokens.length === 0) return;
+
+    const name = tokens[0]; // 第一個 Token 當作姓名
+    if (!name) return;
+
     let detectedSessions: string[] = [];
 
+    // 4. 解析等級、性別文字與時段
     tokens.slice(1).forEach(token => {
       const upper = token.toUpperCase();
+
+      // 文字性別判斷
       if (['M', '男', 'MALE'].includes(upper)) gender = 'M';
       else if (['F', '女', 'FEMALE'].includes(upper)) gender = 'F';
 
+      // 等級數字解析 (支援純數字如 8, 11 或 帶級字如 8級)
       const numMatch = token.match(/\d+/);
       if (numMatch) {
         const lvlNum = parseInt(numMatch[0], 10);
-        if (lvlNum >= 1 && lvlNum <= 15) level = String(lvlNum);
+        if (lvlNum >= 1 && lvlNum <= 15) {
+          level = String(lvlNum);
+        }
       }
 
+      // 時段匹配
       sessionConfig.value.timeSlots.forEach(slot => {
         if (token.includes(slot) || slot.includes(token)) {
           if (!detectedSessions.includes(slot)) detectedSessions.push(slot);
@@ -336,14 +354,17 @@ const handleFileUpload = (event: Event) => {
       
       if (index === 0 && (cols[0].includes('姓名') || cols[0].includes('Name'))) return;
 
-      const name = cols[0];
+      let name = cols[0];
       if (!name) return;
 
       let gender = batchDefaultGender.value;
+      if (name.includes('🚺')) { gender = 'F'; name = name.replace(/🚺/g, '').trim(); }
+      if (name.includes('🚹')) { gender = 'M'; name = name.replace(/🚹/g, '').trim(); }
+
       if (cols[1]) {
         const gUpper = cols[1].toUpperCase();
-        if (['F', '女'].includes(gUpper)) gender = 'F';
-        else if (['M', '男'].includes(gUpper)) gender = 'M';
+        if (['F', '女', '🚺'].includes(gUpper)) gender = 'F';
+        else if (['M', '男', '🚹'].includes(gUpper)) gender = 'M';
       }
 
       let level = cols[2] ? String(parseInt(cols[2], 10) || batchDefaultLevel.value) : batchDefaultLevel.value;
@@ -617,11 +638,9 @@ const savePlayerEdit = () => {
   const targetId = editingPlayer.value.id;
   const newPartnerId = editingPlayer.value.partnerId ? String(editingPlayer.value.partnerId) : null;
 
-  // 1. 取得舊資料以確認搭檔變更情況
   const oldPlayer = queuePlayers.value.find(p => String(p.id) === String(targetId));
   const oldPartnerId = oldPlayer?.partnerId ? String(oldPlayer.partnerId) : null;
 
-  // 2. 更新目標選手
   queuePlayers.value = queuePlayers.value.map(p => {
     if (String(p.id) === String(targetId)) {
       return { ...editingPlayer.value!, partnerId: newPartnerId };
@@ -629,9 +648,7 @@ const savePlayerEdit = () => {
     return p;
   });
 
-  // 3. 處理雙向搭檔綁定與解除
   if (oldPartnerId !== newPartnerId) {
-    // 若原先有舊搭檔，幫舊搭檔解除綁定
     if (oldPartnerId) {
       queuePlayers.value.forEach(p => {
         if (String(p.id) === oldPartnerId && String(p.partnerId) === String(targetId)) {
@@ -639,11 +656,9 @@ const savePlayerEdit = () => {
         }
       });
     }
-    // 若設定了新搭檔，幫新搭檔雙向綁定
     if (newPartnerId) {
       queuePlayers.value.forEach(p => {
         if (String(p.id) === newPartnerId) {
-          // 若新搭檔原本也有其他舊搭檔，解除其關係
           if (p.partnerId && String(p.partnerId) !== String(targetId)) {
             const prevPartner = queuePlayers.value.find(x => String(x.id) === String(p.partnerId));
             if (prevPartner) prevPartner.partnerId = null;
@@ -711,7 +726,6 @@ const batchDeletePlayers = () => {
   if (selectedPlayerIds.value.length === 0) return;
   if (!confirm(`確定要刪除選中的 ${selectedPlayerIds.value.length} 位選手嗎？`)) return;
 
-  // 清除被刪除選手的搭檔關號
   queuePlayers.value.forEach(p => {
     if (p.partnerId && selectedPlayerIds.value.includes(p.partnerId)) {
       p.partnerId = null;
@@ -747,24 +761,19 @@ const isPreferredLevel = (courtPlayers: Player[], targetPlayer: Player): boolean
   return courtPlayers.every(p => Math.abs(Number(p.level) - targetLevel) <= 2);
 };
 
-// 填補單一場地指定區域的輔助函式 (含有捆綁搭檔邏輯)
 const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', activeQueue: Player[]) => {
   const tryAddPlayerAndPartner = (candidate: Player, strictLevel: boolean): boolean => {
     if (court[targetZone].length >= 4) return false;
     if (strictLevel && !isPreferredLevel(court[targetZone], candidate)) return false;
 
-    // 檢查是否有搭檔
     const partner = activeQueue.find(p => String(p.id) === String(candidate.partnerId));
 
     if (partner) {
-      // 空間不足容納搭檔雙人，跳過
       if (court[targetZone].length > 2) return false;
       if (strictLevel && !isPreferredLevel(court[targetZone], partner)) return false;
 
-      // 加入主要選手與搭檔
       court[targetZone].push(candidate, partner);
 
-      // 從佇列陣列中移除
       [candidate, partner].forEach(item => {
         const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(item.id));
         if (idxInQueue !== -1) queuePlayers.value.splice(idxInQueue, 1);
@@ -774,7 +783,6 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
       });
       return true;
     } else {
-      // 無搭檔，單人加入
       court[targetZone].push(candidate);
 
       const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(candidate.id));
@@ -787,7 +795,6 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
     }
   };
 
-  // 階段 1：實施等級相近優先機制 (strictLevel = true)
   let i = 0;
   while (court[targetZone].length < 4 && i < activeQueue.length) {
     const candidate = activeQueue[i];
@@ -799,7 +806,6 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
     }
   }
 
-  // 階段 2：若是還沒補滿，放寬等級限制補滿 (strictLevel = false)
   i = 0;
   while (court[targetZone].length < 4 && i < activeQueue.length) {
     const candidate = activeQueue[i];
@@ -812,7 +818,6 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
   }
 };
 
-// 單場補滿邏輯 (依序補滿 players 再補 nextPlayers)
 const fillCourtAuto = (court: Court) => {
   const activeQueue = filteredQueuePlayers.value.filter(p => String(p.status) !== '0' && !isPlayerLimitReached(p));
   activeQueue.sort((a, b) => a.playedCount - b.playedCount);
@@ -826,21 +831,18 @@ const fillCourtAuto = (court: Court) => {
   saveToLocalStorage();
 };
 
-// 全場一鍵自動配對：優先將【所有場地】的正選區 (players) 補滿，再補預備區 (nextPlayers)
 const autoAssignAllCourts = () => {
   const activeQueue = filteredQueuePlayers.value.filter(p => String(p.status) !== '0' && !isPlayerLimitReached(p));
   if (activeQueue.length === 0) return alert('目前佇列中沒有可安排上場的球員！');
   
   activeQueue.sort((a, b) => a.playedCount - b.playedCount);
 
-  // 1st Round: 優先遍歷所有場地，把【空閒場地的場上位置 (players)】補滿
   courts.value.forEach(court => {
     if (court.status === 'idle' && court.players.length < 4) {
       fillZoneForCourt(court, 'players', activeQueue);
     }
   });
 
-  // 2nd Round: 所有場地的場上位置都滿了之後，才遍歷補滿【預備區 (nextPlayers)】
   courts.value.forEach(court => {
     if (court.nextPlayers.length < 4) {
       fillZoneForCourt(court, 'nextPlayers', activeQueue);
@@ -867,7 +869,6 @@ const addPlayerToAvailableCourt = (player: Player) => {
     return alert(`搭檔【${partner.name}】已打滿個人上限，無法一起上場！`);
   }
 
-  // 尋找適合的場地
   const targetCourt = courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots && isPreferredLevel(c.players, player))
     || courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots)
     || courts.value.find(c => (4 - c.nextPlayers.length) >= neededSlots && isPreferredLevel(c.nextPlayers, player))
@@ -877,14 +878,12 @@ const addPlayerToAvailableCourt = (player: Player) => {
 
   const zone = (targetCourt.status === 'idle' && (4 - targetCourt.players.length) >= neededSlots) ? 'players' : 'nextPlayers';
   
-  // 搬移主要選手
   const index = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
   if (index !== -1) {
     queuePlayers.value.splice(index, 1);
     targetCourt[zone].push(player);
   }
 
-  // 搬移搭檔選手
   if (partner) {
     const partnerIndex = queuePlayers.value.findIndex(p => String(p.id) === String(partner.id));
     if (partnerIndex !== -1) {
@@ -949,10 +948,9 @@ const dragOptions = computed(() => ({
   animation: 200,
   group: "badminton-app",
   ghostClass: "ghost",
-  // 增加下面這幾行設定，能大幅改善行動裝置上的拖曳流暢度
-  delay: 0,                 // 移除觸控延遲（或設為 50~100ms 避免跟點擊衝突）
-  touchStartThreshold: 5,   // 手指滑動超過 5px 才正式觸發拖曳，避免輕觸時卡住
-  forceFallback: true,      // 啟用強制降級渲染（解決部分 iOS/Android 原生拖曳 API 閃爍或失效的問題）
+  delay: 0,
+  touchStartThreshold: 5,
+  forceFallback: true,
   fallbackClass: "sortable-fallback"
 }));
 
@@ -970,7 +968,7 @@ const getGenderText = (gender: string) => {
 
 <template>
   <div class="app-main-layout">
-    <!-- 畫面 1: 今日開場參數與批次報名設定 (改為左/中/右 三欄佈局) -->
+    <!-- 畫面 1: 今日開場參數與批次報名設定 -->
     <div v-if="currentView === 'setup'" class="setup-container">
       <div class="setup-grid">
         <!-- 左側：活動參數設定 -->
@@ -1006,7 +1004,6 @@ const getGenderText = (gender: string) => {
               <small class="hint-text">💡 報名 2 個時段的選手，總上限將自動倍增（如 4 場 ➔ 8 場）。</small>
             </div>
 
-            <!-- 今日開場時段設定 -->
             <div class="form-item">
               <div class="slot-label-row">
                 <label>⏰ 今日開放時段：</label>
@@ -1034,7 +1031,7 @@ const getGenderText = (gender: string) => {
         <div class="setup-card">
           <div class="setup-header">
             <h2>📋 2. 選手批次報名</h2>
-            <p>可直接複製 LINE 名單貼上，或讀取 CSV 檔案 (自動併入重複人名與時段)</p>
+            <p>可直接複製 LINE 名單貼上，或讀取 CSV 檔案 (支援 🚺/🚹 性別與等級)</p>
           </div>
 
           <div class="batch-defaults">
@@ -1054,7 +1051,6 @@ const getGenderText = (gender: string) => {
             </div>
           </div>
 
-          <!-- 報名時段預設勾選區 -->
           <div class="batch-sessions-select">
             <label class="session-label">預設帶入時段：</label>
             <div class="checkbox-group">
@@ -1065,40 +1061,40 @@ const getGenderText = (gender: string) => {
             </div>
           </div>
 
-          <!-- 方式 1: 貼上多行名單 -->
           <div class="form-item" style="margin-top: 10px;">
-            <label>快速貼上名單（每行一位，支援包含等級/性別/時段）：</label>
+            <label>快速貼上名單（支援 🚺/🚹 符號、等級、編號）：</label>
             <textarea 
               v-model="batchText" 
-              rows="4" 
+              rows="6" 
               class="batch-textarea" 
-              placeholder="範例格式（同名選手將自動合併時段）：
-1. 戴資穎 F 15級 18:00-20:00
-2. 林丹 M 15級 20:00-22:00
-3. 周天成 11 18:00-20:00
-4. 周天成 11 20:00-22:00"
+              placeholder="範例格式：
+01.威力 11
+02.阿布 13
+03.Romy 8 🚺
+04.球球 7🚺
+05.胖吉 9
+07. 慈慈 7🚺"
             ></textarea>
             <button class="btn-import-text" @click="parseAndImportText">📥 批次匯入文字名單</button>
           </div>
 
           <hr class="divider" />
 
-          <!-- 方式 2: CSV 檔案上傳 -->
           <div class="form-item">
             <label>或 上傳 CSV 檔案匯入：</label>
             <input type="file" accept=".csv" @change="handleFileUpload" class="file-input" />
-            <small class="tip">CSV 欄位順序：姓名, 性別(M/F), 等級(1-15), 時段(用 / 分隔)</small>
+            <small class="tip">CSV 欄位順序：姓名, 性別(M/F/🚺), 等級(1-15), 時段(用 / 分隔)</small>
           </div>
         </div>
 
-        <!-- 右側：目前已報名名單預覽區 (三欄佈局) -->
+        <!-- 右側：目前已報名名單預覽區 -->
         <div class="setup-card preview-card">
           <div class="setup-header preview-header">
             <h3>👥 已報名選手名單 ({{ queuePlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
             <button class="btn-clear-all" @click="clearAllPlayersInSetup" v-if="queuePlayers.length > 0">🗑 清空</button>
           </div>
 
-          <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用左側批次報名工具。</div>
+          <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用中間批次報名工具。</div>
           <div v-else class="preview-player-tags">
             <div v-for="p in queuePlayers" :key="p.id" class="preview-tag">
               <span v-if="getGenderText(p.gender)" class="p-gender" :class="p.gender === 'M' ? 'male' : 'female'">{{ getGenderText(p.gender) }}</span>
@@ -1125,7 +1121,6 @@ const getGenderText = (gender: string) => {
               </span>
             </h1>
 
-            <!-- 時段切換過濾器 (依時間排序) -->
             <div class="session-filter-bar">
               <span class="filter-label">⏰ 時段篩選:</span>
               <button class="btn-session-filter" :class="{ active: currentSessionFilter === 'all' }" @click="currentSessionFilter = 'all'">全部時段</button>
@@ -1152,7 +1147,7 @@ const getGenderText = (gender: string) => {
       </header>
 
       <main class="app-content-wrapper">
-        <!-- 左側場地區 (獨立區塊，可往下捲動) -->
+        <!-- 左側場地區 -->
         <section class="courts-section">
           <div class="section-header">
             <h2>🏸 場地動態 ({{ courts.length }} 個場地)</h2>
@@ -1222,7 +1217,6 @@ const getGenderText = (gender: string) => {
                 </div>
               </draggable>
 
-              <!-- 控制按鈕 -->
               <div class="court-actions">
                 <button v-if="court.status === 'idle'" class="btn-start-match" @click="startMatch(court)">▶ 開始比賽</button>
                 <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局</button>
@@ -1231,7 +1225,7 @@ const getGenderText = (gender: string) => {
           </div>
         </section>
 
-        <!-- 右側等待佇列 (固定獨立區塊) -->
+        <!-- 右側等待佇列 -->
         <section class="queue-section">
           <div class="section-header">
             <div class="header-title-group">
@@ -1241,7 +1235,6 @@ const getGenderText = (gender: string) => {
               </button>
             </div>
 
-            <!-- 分區 Tab -->
             <div class="group-mode-switch">
               <span class="switch-label">分區方式：</span>
               <button class="btn-mode-tab" :class="{ active: queueGroupMode === 'level' }" @click="toggleGroupMode('level')">
@@ -1255,7 +1248,6 @@ const getGenderText = (gender: string) => {
               </button>
             </div>
 
-            <!-- 批次操作工具列 -->
             <div v-if="isBatchMode" class="batch-actions-bar">
               <button class="btn-batch-select-all" @click="toggleSelectAll">
                 {{ selectedPlayerIds.length === currentTabPlayers.length && currentTabPlayers.length > 0 ? '全不選' : '全選本頁' }}
@@ -1388,7 +1380,6 @@ const getGenderText = (gender: string) => {
               <input type="text" v-model="editingPlayer.name" class="form-input" />
             </div>
             
-            <!-- 綁定搭檔選擇欄位 -->
             <div class="form-group">
               <label>👥 綁定搭檔 (一起上場)：</label>
               <select v-model="editingPlayer.partnerId" class="form-select">
@@ -1449,12 +1440,9 @@ const getGenderText = (gender: string) => {
 </template>
 
 <style scoped>
-/* ==========================================
-   1. 全局配置與基礎變數
-   ========================================== */
 .app-main-layout {
   min-height: 100vh;
-  min-height: 100dvh; /* 適應手機瀏覽器動態網址列 */
+  min-height: 100dvh;
   background-color: #f8fafc;
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   color: #334155;
@@ -1462,17 +1450,9 @@ const getGenderText = (gender: string) => {
   -webkit-tap-highlight-color: transparent;
 }
 
-.touch-action-none {
-  touch-action: none;
-}
+.touch-action-none { touch-action: none; }
+.clickable { cursor: pointer; }
 
-.clickable {
-  cursor: pointer;
-}
-
-/* ==========================================
-   2. 畫面 1: 開場設定頁面 (Setup View - 三欄式佈局)
-   ========================================== */
 .setup-container {
   display: flex;
   justify-content: center;
@@ -1484,7 +1464,6 @@ const getGenderText = (gender: string) => {
 
 .setup-grid {
   display: grid;
-  /* 寬螢幕下固定分成左、中、右 3 欄 */
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 20px;
   width: 100%;
@@ -1571,9 +1550,7 @@ const getGenderText = (gender: string) => {
   transition: border-color 0.2s;
 }
 
-.setup-input:focus {
-  border-color: #2563eb;
-}
+.setup-input:focus { border-color: #2563eb; }
 
 .setup-actions {
   margin-top: 16px;
@@ -1593,9 +1570,7 @@ const getGenderText = (gender: string) => {
   transition: background-color 0.2s;
 }
 
-.btn-start-session:hover {
-  background-color: #1d4ed8;
-}
+.btn-start-session:hover { background-color: #1d4ed8; }
 
 .slots-editor {
   display: flex;
@@ -1625,14 +1600,8 @@ const getGenderText = (gender: string) => {
   padding: 0 2px;
 }
 
-.add-slot-row {
-  display: flex;
-  gap: 8px;
-}
-
-.small-input {
-  max-width: 160px;
-}
+.add-slot-row { display: flex; gap: 8px; }
+.small-input { max-width: 160px; }
 
 .btn-add-slot {
   padding: 6px 12px;
@@ -1801,13 +1770,8 @@ const getGenderText = (gender: string) => {
   padding: 0 4px;
 }
 
-.btn-remove-tag:hover {
-  color: #ef4444;
-}
+.btn-remove-tag:hover { color: #ef4444; }
 
-/* ==========================================
-   3. 畫面 2: 頂部 Header 與控制工具列
-   ========================================== */
 .app-header {
   background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
   color: #ffffff;
@@ -1862,10 +1826,7 @@ const getGenderText = (gender: string) => {
   flex-wrap: wrap;
 }
 
-.filter-label {
-  font-size: 0.8rem;
-  color: #94a3b8;
-}
+.filter-label { font-size: 0.8rem; color: #94a3b8; }
 
 .btn-session-filter {
   background: rgba(255, 255, 255, 0.08);
@@ -1878,10 +1839,7 @@ const getGenderText = (gender: string) => {
   transition: all 0.2s ease;
 }
 
-.btn-session-filter:hover {
-  background: rgba(255, 255, 255, 0.18);
-  color: #fff;
-}
+.btn-session-filter:hover { background: rgba(255, 255, 255, 0.18); color: #fff; }
 
 .btn-session-filter.active {
   background: #2563eb;
@@ -1913,9 +1871,7 @@ const getGenderText = (gender: string) => {
   min-height: 34px;
 }
 
-.header-controls button:hover:not(:disabled) {
-  filter: brightness(1.08);
-}
+.header-controls button:hover:not(:disabled) { filter: brightness(1.08); }
 
 .btn-setup-reconfig { background-color: #334155; color: #f8fafc; }
 .btn-add-player { background-color: #059669; color: white; }
@@ -1947,9 +1903,6 @@ const getGenderText = (gender: string) => {
   font-weight: 600;
 }
 
-/* ==========================================
-   4. 主看板區域 (雙欄 / 上下 彈性 Grid 佈局)
-   ========================================== */
 .app-content-wrapper {
   max-width: 1600px;
   margin: 12px auto 0 auto;
@@ -1961,7 +1914,6 @@ const getGenderText = (gender: string) => {
   box-sizing: border-box;
 }
 
-/* 左側場地區 */
 .courts-section {
   display: flex;
   flex-direction: column;
@@ -1973,7 +1925,6 @@ const getGenderText = (gender: string) => {
   padding-right: 4px;
 }
 
-/* 右側等待佇列區 */
 .queue-section {
   background: #ffffff;
   border-radius: 14px;
@@ -2011,10 +1962,7 @@ const getGenderText = (gender: string) => {
   align-items: center;
 }
 
-.header-tip {
-  font-size: 0.725rem;
-  color: #64748b;
-}
+.header-tip { font-size: 0.725rem; color: #64748b; }
 
 .courts-grid {
   display: grid;
@@ -2047,11 +1995,7 @@ const getGenderText = (gender: string) => {
   padding-bottom: 6px;
 }
 
-.title-with-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
+.title-with-status { display: flex; align-items: center; gap: 6px; }
 
 .court-header h3 {
   margin: 0;
@@ -2060,11 +2004,7 @@ const getGenderText = (gender: string) => {
   font-weight: 700;
 }
 
-.court-header-right {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
+.court-header-right { display: flex; align-items: center; gap: 6px; }
 
 .match-timer {
   font-size: 0.75rem;
@@ -2085,10 +2025,7 @@ const getGenderText = (gender: string) => {
   font-weight: 600;
 }
 
-.player-count.full {
-  background-color: #dcfce7;
-  color: #15803d;
-}
+.player-count.full { background-color: #dcfce7; color: #15803d; }
 
 .status-badge {
   font-size: 0.7rem;
@@ -2099,10 +2036,7 @@ const getGenderText = (gender: string) => {
   font-weight: 600;
 }
 
-.status-badge.playing {
-  background: #dbeafe;
-  color: #1d4ed8;
-}
+.status-badge.playing { background: #dbeafe; color: #1d4ed8; }
 
 .zone-label {
   font-size: 0.7rem;
@@ -2113,10 +2047,7 @@ const getGenderText = (gender: string) => {
   gap: 4px;
 }
 
-.next-zone-label {
-  margin-top: 2px;
-  color: #64748b;
-}
+.next-zone-label { margin-top: 2px; color: #64748b; }
 
 .player-list {
   min-height: 70px;
@@ -2142,10 +2073,7 @@ const getGenderText = (gender: string) => {
   user-select: none;
 }
 
-.player-card.is-next-up {
-  background-color: #fdfdfd;
-  border-style: dashed;
-}
+.player-card.is-next-up { background-color: #fdfdfd; border-style: dashed; }
 
 .player-info {
   display: flex;
@@ -2158,7 +2086,6 @@ const getGenderText = (gender: string) => {
 
 .player-gender.male { color: #2563eb; }
 .player-gender.female { color: #ec4899; }
-
 .player-name { color: #1e293b; }
 
 .partner-badge {
@@ -2212,11 +2139,7 @@ const getGenderText = (gender: string) => {
   background-color: #eff6ff;
 }
 
-.player-stats {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
+.player-stats { display: flex; align-items: center; gap: 4px; }
 
 .level-tag {
   background-color: #f1f5f9;
@@ -2241,11 +2164,7 @@ const getGenderText = (gender: string) => {
   font-weight: bold;
 }
 
-.player-actions-right {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
+.player-actions-right { display: flex; align-items: center; gap: 4px; }
 
 .btn-quick-add {
   background: #dbeafe;
@@ -2262,10 +2181,7 @@ const getGenderText = (gender: string) => {
   padding: 0;
 }
 
-.court-actions {
-  margin-top: auto;
-  padding-top: 2px;
-}
+.court-actions { margin-top: auto; padding-top: 2px; }
 
 .btn-start-match, .btn-finish-match {
   width: 100%;
@@ -2280,9 +2196,6 @@ const getGenderText = (gender: string) => {
 .btn-start-match { background-color: #16a34a; color: white; }
 .btn-finish-match { background-color: #dc2626; color: white; }
 
-/* ==========================================
-   5. 等待佇列區塊細節
-   ========================================== */
 .btn-toggle-batch {
   padding: 3px 6px;
   font-size: 0.725rem;
@@ -2307,10 +2220,7 @@ const getGenderText = (gender: string) => {
   flex-wrap: wrap;
 }
 
-.switch-label {
-  font-size: 0.75rem;
-  color: #64748b;
-}
+.switch-label { font-size: 0.75rem; color: #64748b; }
 
 .btn-mode-tab {
   padding: 2px 6px;
@@ -2353,11 +2263,7 @@ const getGenderText = (gender: string) => {
   cursor: pointer;
 }
 
-.batch-btns {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-}
+.batch-btns { display: flex; gap: 4px; flex-wrap: wrap; }
 
 .batch-btns button {
   padding: 3px 6px;
@@ -2382,10 +2288,7 @@ const getGenderText = (gender: string) => {
   flex: 1;
 }
 
-.queue-group {
-  display: flex;
-  flex-direction: column;
-}
+.queue-group { display: flex; flex-direction: column; }
 
 .group-header {
   display: flex;
@@ -2401,32 +2304,12 @@ const getGenderText = (gender: string) => {
   user-select: none;
 }
 
-.group-title {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
+.group-title { display: flex; align-items: center; gap: 4px; }
+.collapse-icon { font-size: 0.6rem; color: #64748b; }
+.group-count { font-size: 0.7rem; color: #64748b; font-weight: normal; }
 
-.collapse-icon {
-  font-size: 0.6rem;
-  color: #64748b;
-}
+.checkbox-wrapper { margin-right: 4px; display: flex; align-items: center; }
 
-.group-count {
-  font-size: 0.7rem;
-  color: #64748b;
-  font-weight: normal;
-}
-
-.checkbox-wrapper {
-  margin-right: 4px;
-  display: flex;
-  align-items: center;
-}
-
-/* ==========================================
-   6. Modal 彈窗樣式
-   ========================================== */
 .modal-overlay {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
@@ -2461,11 +2344,7 @@ const getGenderText = (gender: string) => {
   padding-bottom: 6px;
 }
 
-.modal-header h3 {
-  margin: 0;
-  font-size: 1rem;
-  color: #0f172a;
-}
+.modal-header h3 { margin: 0; font-size: 1rem; color: #0f172a; }
 
 .btn-close {
   border: none;
@@ -2475,28 +2354,10 @@ const getGenderText = (gender: string) => {
   cursor: pointer;
 }
 
-.modal-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.form-group {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.form-group label {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: #334155;
-}
-
-.hint-text {
-  font-size: 0.7rem;
-  color: #64748b;
-}
+.modal-body { display: flex; flex-direction: column; gap: 10px; }
+.form-group { display: flex; flex-direction: column; gap: 4px; }
+.form-group label { font-size: 0.8rem; font-weight: 600; color: #334155; }
+.hint-text { font-size: 0.7rem; color: #64748b; }
 
 .form-input, .form-select {
   padding: 6px 10px;
@@ -2522,102 +2383,31 @@ const getGenderText = (gender: string) => {
   font-size: 0.825rem;
 }
 
-.btn-cancel {
-  background: #f1f5f9;
-  color: #475569;
-  border: 1px solid #cbd5e1;
-}
+.btn-cancel { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; }
+.btn-save { background: #2563eb; color: white; border: none; }
 
-.btn-save {
-  background: #2563eb;
-  color: white;
-  border: none;
-}
-
-/* ==========================================
-   7. 精準響應式斷點 (Responsive Breakpoints)
-   ========================================== */
-
-/* --- 中型螢幕 (平板/筆電: 768px ~ 1100px 時改為兩欄，名單降為下方滿寬) --- */
 @media (max-width: 1100px) {
-  .setup-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .preview-card {
-    grid-column: 1 / -1;
-    max-height: none;
-  }
+  .setup-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .preview-card { grid-column: 1 / -1; max-height: none; }
 }
 
-/* --- 小型螢幕 / 直立平板 (螢幕寬度 < 768px 時切換成單欄) --- */
 @media (max-width: 767px) {
-  .setup-grid {
-    grid-template-columns: 1fr;
-  }
-  .app-content-wrapper {
-    grid-template-columns: 1fr;
-    gap: 14px;
-  }
-
-  .courts-section {
-    max-height: none;
-    overflow-y: visible;
-  }
-
-  .queue-section {
-    position: static;
-    max-height: 450px;
-  }
-
-  .courts-grid {
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  }
+  .setup-grid { grid-template-columns: 1fr; }
+  .app-content-wrapper { grid-template-columns: 1fr; gap: 14px; }
+  .courts-section { max-height: none; overflow-y: visible; }
+  .queue-section { position: static; max-height: 450px; }
+  .courts-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
 }
 
-/* --- 手機極小螢幕 (Mobile: < 500px) --- */
 @media (max-width: 499px) {
-  .app-header {
-    padding: 8px 10px;
-  }
-
-  .app-title {
-    font-size: 1.05rem;
-  }
-
-  .header-top-row {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 6px;
-  }
-
-  .session-filter-bar {
-    width: 100%;
-    overflow-x: auto;
-  }
-
-  .header-controls {
-    width: 100%;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-  }
-
-  .court-selector {
-    grid-column: 1 / -1;
-    margin-left: 0;
-    justify-content: space-between;
-  }
-
-  .courts-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .setup-container {
-    padding: 10px;
-  }
-
-  .player-list, .player-card {
-    touch-action: none;
-  }
+  .app-header { padding: 8px 10px; }
+  .app-title { font-size: 1.05rem; }
+  .header-top-row { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .session-filter-bar { width: 100%; overflow-x: auto; }
+  .header-controls { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .court-selector { grid-column: 1 / -1; margin-left: 0; justify-content: space-between; }
+  .courts-grid { grid-template-columns: 1fr; }
+  .setup-container { padding: 10px; }
+  .player-list, .player-card { touch-action: none; }
 }
 </style>
