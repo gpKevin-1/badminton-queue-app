@@ -635,6 +635,18 @@ const handlePlayerAddedToCourt = (evt: any) => {
     return;
   }
 
+  const targetListEl = evt.to;
+  const courtId = Number(targetListEl.dataset.courtId);
+  const targetCourt = courts.value.find(c => c.id === courtId);
+
+  if (targetCourt && targetCourt.players.length > 4) {
+    const swappedPlayer = targetCourt.players.shift();
+    if (swappedPlayer && String(swappedPlayer.id) !== String(player.id)) {
+      swappedPlayer.queueEnteredAt = Date.now();
+      queuePlayers.value.push(swappedPlayer);
+    }
+  }
+
   const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
   if (idx !== -1) {
     queuePlayers.value.splice(idx, 1);
@@ -647,12 +659,11 @@ const handlePlayerAddedToGlobalNextSlot = (slotIndex: number, evt: any) => {
   if (!player) return;
 
   if (globalNextSlots.value[slotIndex].length > 4) {
-    alert(`預備組 ${slotIndex + 1} 最多只能放 4 個人！`);
-    globalNextSlots.value[slotIndex] = globalNextSlots.value[slotIndex].filter(p => String(p.id) !== String(player.id));
-    if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
-      queuePlayers.value.push(player);
+    const swapped = globalNextSlots.value[slotIndex].shift();
+    if (swapped && String(swapped.id) !== String(player.id)) {
+      swapped.queueEnteredAt = Date.now();
+      queuePlayers.value.push(swapped);
     }
-    return;
   }
 
   const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
@@ -1116,7 +1127,6 @@ const clearAllCourts = () => {
   saveToLocalStorage();
 };
 
-// 🌟 優化 Mobile 拖拽延遲：避免手按下滑動頁面時被判定為拖拉
 const dragOptions = computed(() => ({
   animation: 200,
   group: "badminton-app",
@@ -1143,7 +1153,7 @@ const getGenderText = (gender: string) => {
 <template>
   <div class="app-main-layout">
     <!-- 畫面 1: 今日開場參數與批次報名設定 -->
-    <div v-if="currentView === 'setup'" class="setup-container">
+    <div v-if="currentView === 'setup'" class="setup-container custom-scrollbar">
       <div class="setup-grid">
         <div class="setup-card">
           <div class="setup-header">
@@ -1260,7 +1270,7 @@ const getGenderText = (gender: string) => {
           </div>
 
           <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用中間批次報名工具。</div>
-          <div v-else class="preview-player-tags">
+          <div v-else class="preview-player-tags custom-scrollbar">
             <div v-for="p in queuePlayers" :key="p.id" class="preview-tag">
               <span v-if="getGenderText(p.gender)" class="p-gender" :class="p.gender === 'M' ? 'male' : 'female'">{{ getGenderText(p.gender) }}</span>
               <span class="p-name">{{ p.name }}</span>
@@ -1313,14 +1323,14 @@ const getGenderText = (gender: string) => {
 
       <main class="app-content-wrapper">
         <!-- 左側場地區 -->
-        <section class="courts-section">
+        <section class="courts-section custom-scrollbar">
           <!-- 上方：現正對局區 -->
           <div class="courts-sub-section">
             <div class="section-header">
               <h2>🏸 現正對局 ({{ courts.length }} 個場地)</h2>
             </div>
 
-            <div class="courts-grid-scroll-area">
+            <div class="courts-grid-scroll-area custom-scrollbar">
               <div class="courts-grid">
                 <div v-for="court in courts" :key="court.id" class="court-card" :class="court.status">
                   <div class="court-header">
@@ -1340,6 +1350,7 @@ const getGenderText = (gender: string) => {
                     <span>🏸 上場球員 ({{ court.players.length }}/4)</span>
                   </div>
                   <draggable class="player-list court-player-list touch-action-y"
+                             :data-court-id="court.id"
                              v-model="court.players"
                              v-bind="dragOptions"
                              :disabled="court.status === 'playing'"
@@ -1375,7 +1386,7 @@ const getGenderText = (gender: string) => {
               <h2>📋 全場統一下局預備區 (共 4 個預備組)</h2>
             </div>
             
-            <div class="global-next-scroll-area">
+            <div class="global-next-scroll-area custom-scrollbar">
               <div class="global-next-slots-grid">
                 <div v-for="(slotPlayers, sIdx) in globalNextSlots" :key="sIdx" class="next-slot-card">
                   <div class="next-slot-header">
@@ -1411,7 +1422,7 @@ const getGenderText = (gender: string) => {
         </section>
 
         <!-- 右側等待佇列 -->
-        <section class="queue-section">
+        <section class="queue-section custom-scrollbar">
           <div class="section-header">
             <div class="header-title-group">
               <h2>⏳ 等待佇列 ({{ filteredQueuePlayers.length }} / {{ queuePlayers.length }} 人)</h2>
@@ -1673,43 +1684,46 @@ const getGenderText = (gender: string) => {
   font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   color: #334155;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
 }
 
-/* 🌟 允許 Y 軸上下滾動，解決觸控卡死問題 */
-.touch-action-y { 
-  touch-action: pan-y; 
-}
+.touch-action-y { touch-action: pan-y; }
 .clickable { cursor: pointer; }
 
-/* 🌟 自訂大尺寸常駐高對比 Scrollbar (適用 iOS/Android/Chrome/Safari) */
+/* 🌟 自訂清晰可見的大寬捲軸 (常駐顯示) */
 .custom-scrollbar::-webkit-scrollbar {
-  width: 12px; /* 大尺寸捲軸，方便手機/平板手指抓取 */
-  height: 12px;
-  display: block !important; /* 強制顯示 */
+  width: 10px;
+  height: 10px;
+  display: block !important;
 }
-
 .custom-scrollbar::-webkit-scrollbar-track {
   background: #e2e8f0;
-  border-radius: 8px;
+  border-radius: 6px;
 }
-
 .custom-scrollbar::-webkit-scrollbar-thumb {
   background: #94a3b8;
-  border-radius: 8px;
+  border-radius: 6px;
   border: 2px solid #e2e8f0;
 }
-
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
   background: #64748b;
 }
 
-/* Firefox 常駐捲軸樣式 */
-.custom-scrollbar {
-  scrollbar-width: auto;
-  scrollbar-color: #94a3b8 #e2e8f0;
+/* 🌟 設定頁面容器：允許在手機橫屏或視窗過小時上下滾動 */
+.setup-container { 
+  display: flex; 
+  justify-content: center; 
+  padding: 24px 20px; 
+  max-width: 1440px; 
+  margin: 0 auto; 
+  width: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  max-height: 100vh;
+  -webkit-overflow-scrolling: touch;
 }
 
-.setup-container { display: flex; justify-content: center; padding: 24px 20px; max-width: 1440px; margin: 0 auto; }
 .setup-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; width: 100%; }
 .setup-card { background: #ffffff; border-radius: 12px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05); padding: 20px; display: flex; flex-direction: column; border: 1px solid #e2e8f0; }
 
@@ -1760,7 +1774,7 @@ const getGenderText = (gender: string) => {
 .p-partner { font-size: 0.72rem; background-color: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 4px; margin-left: 4px; }
 .btn-remove-tag { border: none; background: transparent; color: #94a3b8; cursor: pointer; font-weight: bold; }
 
-.app-header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #ffffff; padding: 12px 16px; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); }
+.app-header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #ffffff; padding: 12px 16px; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); flex-shrink: 0; }
 .header-content { max-width: 1600px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
 .header-top-row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
 .app-title { font-size: 1.2rem; margin: 0; display: flex; align-items: center; gap: 8px; font-weight: 700; flex-wrap: wrap; }
@@ -1784,7 +1798,19 @@ const getGenderText = (gender: string) => {
 .court-selector { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: #cbd5e1; background: rgba(255, 255, 255, 0.06); padding: 4px 8px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.1); min-height: 34px; box-sizing: border-box; }
 .court-selector select { padding: 2px 6px; border-radius: 6px; border: 1px solid #475569; background-color: #0f172a; color: white; font-weight: 600; outline: none; }
 
-.app-content-wrapper { max-width: 1600px; margin: 12px auto 0 auto; padding: 0 12px 12px 12px; display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; box-sizing: border-box; }
+.app-content-wrapper { 
+  max-width: 1600px; 
+  width: 100%;
+  margin: 12px auto 0 auto; 
+  padding: 0 12px 12px 12px; 
+  display: grid; 
+  grid-template-columns: minmax(0, 1fr) 340px; 
+  gap: 16px; 
+  align-items: start; 
+  box-sizing: border-box; 
+  flex: 1;
+  min-height: 0; 
+}
 
 .courts-section { 
   display: flex; 
@@ -1792,6 +1818,9 @@ const getGenderText = (gender: string) => {
   width: 100%; 
   min-width: 0; 
   gap: 16px;
+  max-height: calc(100vh - 110px);
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .courts-sub-section {
@@ -1801,18 +1830,17 @@ const getGenderText = (gender: string) => {
 }
 
 .courts-grid-scroll-area {
-  max-height: 400px;
+  max-height: 420px;
   overflow-y: auto;
   padding-right: 4px;
 }
 
 .global-next-scroll-area {
-  max-height: 240px;
+  max-height: 260px;
   overflow-y: auto;
   padding-right: 4px;
 }
 
-/* 🌟 電腦版右側等待佇列容器 */
 .queue-section { 
   background: #ffffff; 
   border-radius: 14px; 
@@ -1822,10 +1850,10 @@ const getGenderText = (gender: string) => {
   display: flex; 
   flex-direction: column; 
   gap: 10px; 
-  max-height: calc(100vh - 120px); 
-  position: sticky; 
-  top: 80px; 
+  max-height: calc(100vh - 110px); 
+  overflow-y: auto; 
   box-sizing: border-box; 
+  -webkit-overflow-scrolling: touch; 
 }
 
 .section-header { margin-bottom: 4px; display: flex; flex-direction: column; gap: 6px; }
@@ -1857,7 +1885,7 @@ const getGenderText = (gender: string) => {
 .global-next-container { min-height: 60px; background-color: #ffffff; border: 1.5px dashed #cbd5e1; border-radius: 6px; padding: 4px; display: flex; flex-direction: column; gap: 4px; }
 
 .player-list { min-height: 70px; background-color: #f8fafc; border: 1.5px dashed #cbd5e1; border-radius: 8px; padding: 5px; display: flex; flex-direction: column; gap: 5px; }
-.player-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03); cursor: grab; user-select: none; }
+.player-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px 8px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03); cursor: grab; user-select: none; }
 .player-card.is-next-up { background-color: #fdfdfd; border-style: dashed; }
 .player-card.is-selected { border-color: #2563eb; background-color: #eff6ff; }
 .player-card.is-resting { opacity: 0.85; background-color: #fffbeb; border-left: 3px solid #f59e0b; }
@@ -1885,44 +1913,34 @@ const getGenderText = (gender: string) => {
 .played-tag.limit-reached { background-color: #ef4444; color: #ffffff; font-weight: bold; }
 
 .player-actions-right { display: flex; align-items: center; gap: 4px; }
-.btn-quick-add { background: #dbeafe; color: #1d4ed8; border: none; border-radius: 4px; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; font-size: 0.85rem; cursor: pointer; padding: 0; }
+.btn-quick-add { background: #dbeafe; color: #1d4ed8; border: none; border-radius: 4px; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; cursor: pointer; padding: 0; }
 
 .court-actions { margin-top: auto; padding-top: 2px; }
 .btn-start-match, .btn-finish-match { width: 100%; padding: 8px; border-radius: 6px; border: none; font-weight: 700; font-size: 0.825rem; cursor: pointer; }
 .btn-start-match { background-color: #16a34a; color: white; }
 .btn-finish-match { background-color: #dc2626; color: white; }
 
-.btn-toggle-batch { padding: 4px 8px; font-size: 0.75rem; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; border-radius: 4px; cursor: pointer; font-weight: 600; }
+.btn-toggle-batch { padding: 3px 6px; font-size: 0.725rem; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; border-radius: 4px; cursor: pointer; font-weight: 600; }
 .btn-toggle-batch.active { background-color: #2563eb; color: #ffffff; border-color: #2563eb; }
 
 .group-mode-switch { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
 .switch-label { font-size: 0.75rem; color: #64748b; }
-.btn-mode-tab { padding: 4px 8px; font-size: 0.75rem; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; border-radius: 4px; cursor: pointer; }
+.btn-mode-tab { padding: 2px 6px; font-size: 0.725rem; border: 1px solid #cbd5e1; background: #f8fafc; color: #475569; border-radius: 4px; cursor: pointer; }
 .btn-mode-tab.active { background: #0f172a; color: white; border-color: #0f172a; }
 
 .batch-actions-bar { display: flex; flex-direction: column; gap: 6px; background-color: #f1f5f9; padding: 6px; border-radius: 6px; }
 .selected-count { font-size: 0.725rem; font-weight: 600; color: #2563eb; }
 .btn-batch-select-all { align-self: flex-start; padding: 2px 5px; font-size: 0.7rem; border: 1px solid #cbd5e1; border-radius: 4px; background: #fff; cursor: pointer; }
 .batch-btns { display: flex; gap: 4px; flex-wrap: wrap; }
-.batch-btns button { padding: 4px 8px; font-size: 0.725rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
+.batch-btns button { padding: 3px 6px; font-size: 0.7rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
 .btn-batch-active { background-color: #10b981; color: white; }
 .btn-batch-rest { background-color: #f59e0b; color: white; }
 .btn-batch-reset { background-color: #6366f1; color: white; }
 .btn-batch-delete { background-color: #ef4444; color: white; }
 
-/* 🌟 右側佇列名單滾動區域：確保有足夠高度與大滾動條 */
-.queue-container { 
-  display: flex; 
-  flex-direction: column; 
-  gap: 8px; 
-  overflow-y: scroll !important; /* 強制啟用捲軸 */
-  padding-right: 6px; 
-  flex: 1; 
-  max-height: calc(100vh - 240px); 
-  -webkit-overflow-scrolling: touch; 
-}
+.queue-container { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-right: 2px; flex: 1; max-height: 55vh; }
 .queue-group { display: flex; flex-direction: column; }
-.group-header { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background-color: #f1f5f9; border-radius: 6px; font-size: 0.825rem; font-weight: bold; margin-bottom: 4px; color: #334155; user-select: none; }
+.group-header { display: flex; justify-content: space-between; align-items: center; padding: 5px 8px; background-color: #f1f5f9; border-radius: 6px; font-size: 0.8rem; font-weight: bold; margin-bottom: 4px; color: #334155; user-select: none; }
 .group-title { display: flex; align-items: center; gap: 4px; }
 .collapse-icon { font-size: 0.6rem; color: #64748b; }
 .group-count { font-size: 0.7rem; color: #64748b; font-weight: normal; }
@@ -1956,34 +1974,33 @@ const getGenderText = (gender: string) => {
 .btn-save { background: #2563eb; color: white; border: none; }
 .btn-danger-sub { background-color: #dc2626 !important; }
 
+/* 🌟 手機橫屏模式專用適配 (最大高度 500px) */
+@media (max-height: 500px) {
+  .setup-container {
+    max-height: calc(100vh - 20px);
+    overflow-y: scroll !important;
+    padding: 12px 10px;
+  }
+}
+
 @media (max-width: 1100px) {
   .setup-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .preview-card { grid-column: 1 / -1; max-height: none; }
 }
 
-/* 🌟 手機與平板專用適配區 (< 767px) */
 @media (max-width: 767px) {
   .setup-grid { grid-template-columns: 1fr; }
-  .app-content-wrapper { grid-template-columns: 1fr; gap: 14px; }
+  .app-content-wrapper { grid-template-columns: 1fr; gap: 14px; height: auto; }
   .courts-section { max-height: none; overflow-y: visible; }
-  
-  /* 手機模式下的等待佇列外框 */
   .queue-section { 
     position: static; 
     max-height: none; 
     overflow-y: visible; 
   }
-  
-  /* 🌟 手機平板下明確定義高、常駐大尺寸捲軸且可直接下滑 */
   .queue-container {
-    max-height: 480px; 
-    overflow-y: scroll !important;
-    border: 1px solid #cbd5e1;
-    border-radius: 8px;
-    padding: 8px 6px 8px 8px;
-    background-color: #ffffff;
+    max-height: 500px;
+    overflow-y: auto;
   }
-  
   .courts-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
   .global-next-slots-grid { grid-template-columns: 1fr; }
 }
