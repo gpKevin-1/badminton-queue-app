@@ -27,8 +27,7 @@ export interface MatchHistoryRecord {
 export interface Court {
   id: number;
   name: string;
-  players: Player[];        // 目前正在場上的球員
-  nextPlayers: Player[];    // 預先排點區的球員
+  players: Player[];        // 目前正在場上的球員 (4人)
   status: 'idle' | 'playing';
   startTime?: number | null;
   elapsedSeconds?: number;
@@ -37,9 +36,9 @@ export interface Court {
 export interface SessionConfig {
   courtCount: number;
   maxPlayersCount: number;
-  maxGamesPerPlayer: number; // 預設/備用上限
-  slotMaxGames: Record<string, number>; // ⏰ 每個時段各自的每人最多打場數設定
-  timeSlots: string[];      // 今日開啟的時段列表
+  maxGamesPerPlayer: number;
+  slotMaxGames: Record<string, number>;
+  timeSlots: string[];
 }
 
 // --- 時段解析與排序輔助函式 ---
@@ -58,6 +57,7 @@ const parseTimeSlot = (slotStr: string): number => {
 const STORAGE_KEY_PLAYERS = 'badminton_queue_players_data';
 const STORAGE_KEY_CONFIG = 'badminton_queue_config_data';
 const STORAGE_KEY_HISTORY = 'badminton_queue_history_data';
+const STORAGE_KEY_GLOBAL_NEXT_SLOTS = 'badminton_queue_global_next_slots_data';
 
 const DEFAULT_TIME_SLOTS = ['19:30-22:30', '22:30-23:30'];
 
@@ -82,20 +82,19 @@ const sortedTimeSlots = computed(() => {
 });
 
 const queuePlayers = ref<Player[]>([]);
-const matchHistories = ref<MatchHistoryRecord[]>([]); // 📊 全局對戰歷史紀錄
+const globalNextSlots = ref<Player[][]>([[], [], [], []]);
+
+const matchHistories = ref<MatchHistoryRecord[]>([]);
 const isLoading = ref<boolean>(false);
 const isDev = ref<boolean>(false);
 
-// 用於即時計算等待時間的當前時間戳
 const currentTime = ref<number>(Date.now());
 
-// 批次報名相關狀態
 const batchText = ref<string>('');
 const batchDefaultGender = ref<string>('-');
 const batchDefaultLevel = ref<string>('5');
 const batchDefaultSessions = ref<string[]>([...DEFAULT_TIME_SLOTS]);
 
-// Modal 狀態
 const isEditModalOpen = ref<boolean>(false);
 const editingPlayer = ref<Player | null>(null);
 
@@ -111,9 +110,7 @@ const newPlayer = ref<Omit<Player, 'id'>>({
   avoidIds: []
 });
 
-// 📊 對戰紀錄 Modal 狀態
 const isHistoryModalOpen = ref<boolean>(false);
-
 const isBatchMode = ref<boolean>(false);
 const selectedPlayerIds = ref<(number | string)[]>([]);
 
@@ -125,7 +122,6 @@ const collapsedGroups = ref<Record<string, boolean>>({
 
 const courts = ref<Court[]>([]);
 
-// --- 動態上限與限制邏輯（累加該選手報名各時段的場數上限） ---
 const getPlayerMaxGames = (player: Player): number => {
   if (!player.sessions || player.sessions.length === 0) {
     return sessionConfig.value.maxGamesPerPlayer || 6;
@@ -147,7 +143,6 @@ const getPartner = (player: Player): Player | undefined => {
   return queuePlayers.value.find(p => String(p.id) === String(player.partnerId));
 };
 
-// --- 等待時間格式化 ---
 const getWaitSeconds = (player: Player): number => {
   if (!player.queueEnteredAt) return 0;
   const diff = Math.floor((currentTime.value - player.queueEnteredAt) / 1000);
@@ -165,7 +160,6 @@ const formatWaitTime = (seconds: number): string => {
   return `${mins}分${String(secs).padStart(2, '0')}秒`;
 };
 
-// --- 計算某兩位球員過去對戰/同場過幾次 ---
 const getPairMatchCount = (nameA: string, nameB: string): number => {
   let count = 0;
   matchHistories.value.forEach(record => {
@@ -176,7 +170,6 @@ const getPairMatchCount = (nameA: string, nameB: string): number => {
   return count;
 };
 
-// --- 時段管理邏輯 ---
 const addTimeSlot = () => {
   const val = newSlotInput.value.trim();
   if (!val) return;
@@ -228,7 +221,6 @@ const initCourts = (count: number) => {
         id: i,
         name: `${i}號場`,
         players: [],
-        nextPlayers: [],
         status: 'idle',
         startTime: null,
         elapsedSeconds: 0
@@ -238,11 +230,11 @@ const initCourts = (count: number) => {
   courts.value = newCourts;
 };
 
-// --- localStorage 操作 ---
 const saveToLocalStorage = () => {
   localStorage.setItem(STORAGE_KEY_PLAYERS, JSON.stringify(queuePlayers.value));
   localStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(sessionConfig.value));
   localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(matchHistories.value));
+  localStorage.setItem(STORAGE_KEY_GLOBAL_NEXT_SLOTS, JSON.stringify(globalNextSlots.value));
 };
 
 const loadFromLocalStorage = () => {
@@ -273,6 +265,18 @@ const loadFromLocalStorage = () => {
       matchHistories.value = JSON.parse(historyData);
     } catch (e) {
       console.error('解析 History 失敗:', e);
+    }
+  }
+
+  const globalNextData = localStorage.getItem(STORAGE_KEY_GLOBAL_NEXT_SLOTS);
+  if (globalNextData) {
+    try {
+      const parsedSlots = JSON.parse(globalNextData);
+      if (Array.isArray(parsedSlots) && parsedSlots.length === 4) {
+        globalNextSlots.value = parsedSlots;
+      }
+    } catch (e) {
+      console.error('解析 GlobalNextSlots 失敗:', e);
     }
   }
 
@@ -489,7 +493,6 @@ const startSession = () => {
 
 const reopenSetup = () => { currentView.value = 'setup'; };
 
-// --- 5. 佇列排序與分區計算 ---
 const queueGroupMode = ref<'level' | 'playedCount' | 'resting'>('level');
 
 const toggleGroupMode = (mode: 'level' | 'playedCount' | 'resting') => {
@@ -587,7 +590,6 @@ const toggleGroupCollapse = (key: string) => {
   collapsedGroups.value[key] = !collapsedGroups.value[key];
 };
 
-// --- 6. 計時器邏輯 ---
 const timerInterval = ref<ReturnType<typeof setInterval> | null>(null);
 
 const startGlobalTimer = () => {
@@ -619,7 +621,6 @@ onUnmounted(() => {
   if (timerInterval.value) clearInterval(timerInterval.value);
 });
 
-// --- 7. 拖曳與看板操作 ---
 const getDraggedPlayer = (evt: any): Player | null => {
   return evt?.item?._underlying_vm_ || evt?.draggedContext?.element || null;
 };
@@ -641,13 +642,35 @@ const handlePlayerAddedToCourt = (evt: any) => {
   }
 };
 
+const handlePlayerAddedToGlobalNextSlot = (slotIndex: number, evt: any) => {
+  const player = getDraggedPlayer(evt);
+  if (!player) return;
+
+  if (globalNextSlots.value[slotIndex].length > 4) {
+    alert(`預備組 ${slotIndex + 1} 最多只能放 4 個人！`);
+    globalNextSlots.value[slotIndex] = globalNextSlots.value[slotIndex].filter(p => String(p.id) !== String(player.id));
+    if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
+      queuePlayers.value.push(player);
+    }
+    return;
+  }
+
+  const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
+  if (idx !== -1) {
+    queuePlayers.value.splice(idx, 1);
+    saveToLocalStorage();
+  }
+};
+
 const handlePlayerAddedToQueue = (evt: any) => {
   const player = getDraggedPlayer(evt);
   if (!player) return;
 
   courts.value.forEach(court => {
     court.players = court.players.filter(p => String(p.id) !== String(player.id));
-    court.nextPlayers = court.nextPlayers.filter(p => String(p.id) !== String(player.id));
+  });
+  globalNextSlots.value.forEach((slotArr, idx) => {
+    globalNextSlots.value[idx] = slotArr.filter(p => String(p.id) !== String(player.id));
   });
 
   if (!queuePlayers.value.some(p => String(p.id) === String(player.id))) {
@@ -801,7 +824,6 @@ const batchResetPlayedCount = () => {
   queuePlayers.value.forEach(p => {
     if (selectedPlayerIds.value.includes(p.id)) {
       p.playedCount = 0;
-      p.lastMatchPeers = []; // 🧹 場次歸零時，同步清除上局同場對象資訊
     }
   });
   saveToLocalStorage();
@@ -840,7 +862,6 @@ const clearAllPlayersInSetup = () => {
   }
 };
 
-// --- 📊 清除對戰紀錄封裝函式 ---
 const clearMatchHistories = () => {
   if (confirm('確定要清除所有對戰紀錄嗎？')) {
     matchHistories.value = [];
@@ -848,7 +869,6 @@ const clearMatchHistories = () => {
   }
 };
 
-// --- 8. 自動配對與場地管理 ---
 const hasAvoidConflict = (courtPlayers: Player[], candidate: Player): boolean => {
   const candidateAvoids = candidate.avoidIds || [];
   for (const p of courtPlayers) {
@@ -870,20 +890,20 @@ const isPreferredLevel = (courtPlayers: Player[], targetPlayer: Player): boolean
   return courtPlayers.every(p => Math.abs(Number(p.level) - targetLevel) <= 2);
 };
 
-const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', activeQueue: Player[]) => {
+const fillZoneForCourt = (court: Court, activeQueue: Player[]) => {
   const tryAddPlayerAndPartner = (candidate: Player, strictLevel: boolean): boolean => {
-    if (court[targetZone].length >= 4) return false;
-    if (strictLevel && !isPreferredLevel(court[targetZone], candidate)) return false;
-    if (!strictLevel && hasAvoidConflict(court[targetZone], candidate)) return false; 
+    if (court.players.length >= 4) return false;
+    if (strictLevel && !isPreferredLevel(court.players, candidate)) return false;
+    if (!strictLevel && hasAvoidConflict(court.players, candidate)) return false; 
 
     const partner = activeQueue.find(p => String(p.id) === String(candidate.partnerId));
 
     if (partner) {
-      if (court[targetZone].length > 2) return false;
-      if (strictLevel && !isPreferredLevel(court[targetZone], partner)) return false;
-      if (!strictLevel && hasAvoidConflict(court[targetZone], partner)) return false;
+      if (court.players.length > 2) return false;
+      if (strictLevel && !isPreferredLevel(court.players, partner)) return false;
+      if (!strictLevel && hasAvoidConflict(court.players, partner)) return false;
 
-      court[targetZone].push(candidate, partner);
+      court.players.push(candidate, partner);
 
       [candidate, partner].forEach(item => {
         const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(item.id));
@@ -894,7 +914,7 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
       });
       return true;
     } else {
-      court[targetZone].push(candidate);
+      court.players.push(candidate);
 
       const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(candidate.id));
       if (idxInQueue !== -1) queuePlayers.value.splice(idxInQueue, 1);
@@ -907,7 +927,7 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
   };
 
   let i = 0;
-  while (court[targetZone].length < 4 && i < activeQueue.length) {
+  while (court.players.length < 4 && i < activeQueue.length) {
     const candidate = activeQueue[i];
     if (candidate) {
       const added = tryAddPlayerAndPartner(candidate, true);
@@ -918,7 +938,7 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
   }
 
   i = 0;
-  while (court[targetZone].length < 4 && i < activeQueue.length) {
+  while (court.players.length < 4 && i < activeQueue.length) {
     const candidate = activeQueue[i];
     if (candidate) {
       const added = tryAddPlayerAndPartner(candidate, false);
@@ -929,19 +949,6 @@ const fillZoneForCourt = (court: Court, targetZone: 'players' | 'nextPlayers', a
   }
 };
 
-const fillCourtAuto = (court: Court) => {
-  const activeQueue = filteredQueuePlayers.value.filter(p => String(p.status) !== '0' && !isPlayerLimitReached(p));
-  activeQueue.sort((a, b) => a.playedCount - b.playedCount);
-
-  if (court.status === 'idle' && court.players.length < 4) {
-    fillZoneForCourt(court, 'players', activeQueue);
-  }
-  if (court.nextPlayers.length < 4) {
-    fillZoneForCourt(court, 'nextPlayers', activeQueue);
-  }
-  saveToLocalStorage();
-};
-
 const autoAssignAllCourts = () => {
   const activeQueue = filteredQueuePlayers.value.filter(p => String(p.status) !== '0' && !isPlayerLimitReached(p));
   if (activeQueue.length === 0) return alert('目前佇列中沒有可安排上場的球員！');
@@ -950,15 +957,22 @@ const autoAssignAllCourts = () => {
 
   courts.value.forEach(court => {
     if (court.status === 'idle' && court.players.length < 4) {
-      fillZoneForCourt(court, 'players', activeQueue);
+      fillZoneForCourt(court, activeQueue);
     }
   });
 
-  courts.value.forEach(court => {
-    if (court.nextPlayers.length < 4) {
-      fillZoneForCourt(court, 'nextPlayers', activeQueue);
+  for (let sIdx = 0; sIdx < 4; sIdx++) {
+    while (globalNextSlots.value[sIdx].length < 4 && activeQueue.length > 0) {
+      const nextPlayer = activeQueue.shift();
+      if (nextPlayer) {
+        globalNextSlots.value[sIdx].push(nextPlayer);
+        const idxInQueue = queuePlayers.value.findIndex(p => String(p.id) === String(nextPlayer.id));
+        if (idxInQueue !== -1) queuePlayers.value.splice(idxInQueue, 1);
+      } else {
+        break;
+      }
     }
-  });
+  }
 
   saveToLocalStorage();
 };
@@ -981,25 +995,43 @@ const addPlayerToAvailableCourt = (player: Player) => {
   }
 
   const targetCourt = courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots && isPreferredLevel(c.players, player))
-    || courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots)
-    || courts.value.find(c => (4 - c.nextPlayers.length) >= neededSlots && isPreferredLevel(c.nextPlayers, player))
-    || courts.value.find(c => (4 - c.nextPlayers.length) >= neededSlots);
+    || courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots);
 
-  if (!targetCourt) return alert(`目前無場地有足夠空位 (${neededSlots}人)！`);
-
-  const zone = (targetCourt.status === 'idle' && (4 - targetCourt.players.length) >= neededSlots) ? 'players' : 'nextPlayers';
-  
-  const index = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
-  if (index !== -1) {
-    queuePlayers.value.splice(index, 1);
-    targetCourt[zone].push(player);
-  }
-
-  if (partner) {
-    const partnerIndex = queuePlayers.value.findIndex(p => String(p.id) === String(partner.id));
-    if (partnerIndex !== -1) {
-      queuePlayers.value.splice(partnerIndex, 1);
-      targetCourt[zone].push(partner);
+  if (targetCourt) {
+    const index = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
+    if (index !== -1) {
+      queuePlayers.value.splice(index, 1);
+      targetCourt.players.push(player);
+    }
+    if (partner) {
+      const partnerIndex = queuePlayers.value.findIndex(p => String(p.id) === String(partner.id));
+      if (partnerIndex !== -1) {
+        queuePlayers.value.splice(partnerIndex, 1);
+        targetCourt.players.push(partner);
+      }
+    }
+  } else {
+    let placed = false;
+    for (let sIdx = 0; sIdx < 4; sIdx++) {
+      if (globalNextSlots.value[sIdx].length + neededSlots <= 4) {
+        const index = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
+        if (index !== -1) {
+          queuePlayers.value.splice(index, 1);
+          globalNextSlots.value[sIdx].push(player);
+        }
+        if (partner) {
+          const partnerIndex = queuePlayers.value.findIndex(p => String(p.id) === String(partner.id));
+          if (partnerIndex !== -1) {
+            queuePlayers.value.splice(partnerIndex, 1);
+            globalNextSlots.value[sIdx].push(partner);
+          }
+        }
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      return alert('所有 4 個預備組目前空間皆已滿！');
     }
   }
 
@@ -1015,14 +1047,12 @@ const startMatch = (court: Court) => {
   court.elapsedSeconds = 0;
 };
 
-// 🏁 結束比賽：原本在場上打完的人送回等待佇列，下局預備區的人遞補上場，並清空預備區
 const finishMatch = (courtId: number) => {
   const court = courts.value.find(c => c.id === courtId);
   if (!court) return;
 
   const playerNames = court.players.map(p => p.name);
   
-  // 記錄對戰歷史
   matchHistories.value.unshift({
     id: 'm_' + Date.now() + '_' + court.id,
     timestamp: Date.now(),
@@ -1030,7 +1060,6 @@ const finishMatch = (courtId: number) => {
     playerNames: [...playerNames]
   });
 
-  // 1. 將剛剛打完比賽的現正對局球員 playedCount + 1，並放回等待佇列
   court.players.forEach(p => {
     p.playedCount += 1;
     p.lastMatchPeers = playerNames.filter(name => name !== p.name);
@@ -1040,13 +1069,17 @@ const finishMatch = (courtId: number) => {
     }
   });
 
-  // 2. 將原本在「下局預備 (nextPlayers)」的球員遞補升格成為「現正對局 (players)」
-  court.players = [...court.nextPlayers];
+  if (globalNextSlots.value[0].length > 0) {
+    court.players = [...globalNextSlots.value[0]];
+  } else {
+    court.players = [];
+  }
+
+  globalNextSlots.value[0] = [...globalNextSlots.value[1]];
+  globalNextSlots.value[1] = [...globalNextSlots.value[2]];
+  globalNextSlots.value[2] = [...globalNextSlots.value[3]];
+  globalNextSlots.value[3] = [];
   
-  // 3. 清空下局預備區
-  court.nextPlayers = []; 
-  
-  // 4. 重置場地狀態為準備中 (idle)
   court.status = 'idle';
   court.startTime = null;
   court.elapsedSeconds = 0;
@@ -1058,17 +1091,26 @@ const clearAllCourts = () => {
   if (courts.value.some(c => c.status === 'playing') && !confirm('有場地正進行比賽，確定要清空嗎？')) return;
 
   courts.value.forEach(court => {
-    court.players.concat(court.nextPlayers).forEach(p => {
+    court.players.forEach(p => {
       p.queueEnteredAt = Date.now();
       if (!queuePlayers.value.some(q => String(q.id) === String(p.id))) {
         queuePlayers.value.push(p);
       }
     });
     court.players = [];
-    court.nextPlayers = [];
     court.status = 'idle';
     court.startTime = null;
     court.elapsedSeconds = 0;
+  });
+
+  globalNextSlots.value.forEach((slotArr, idx) => {
+    slotArr.forEach(p => {
+      p.queueEnteredAt = Date.now();
+      if (!queuePlayers.value.some(q => String(q.id) === String(p.id))) {
+        queuePlayers.value.push(p);
+      }
+    });
+    globalNextSlots.value[idx] = [];
   });
 
   saveToLocalStorage();
@@ -1101,7 +1143,6 @@ const getGenderText = (gender: string) => {
     <!-- 畫面 1: 今日開場參數與批次報名設定 -->
     <div v-if="currentView === 'setup'" class="setup-container">
       <div class="setup-grid">
-        <!-- 左側：活動參數設定 -->
         <div class="setup-card">
           <div class="setup-header">
             <h2>🏸 1. 今日開場參數設定</h2>
@@ -1155,7 +1196,6 @@ const getGenderText = (gender: string) => {
           </div>
         </div>
 
-        <!-- 中間：批次報名匯入工具 -->
         <div class="setup-card">
           <div class="setup-header">
             <h2>📋 2. 選手批次報名</h2>
@@ -1211,7 +1251,6 @@ const getGenderText = (gender: string) => {
           </div>
         </div>
 
-        <!-- 右側：目前已報名名單預覽區 -->
         <div class="setup-card preview-card">
           <div class="setup-header preview-header">
             <h3>👥 已報名選手名單 ({{ queuePlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
@@ -1273,77 +1312,97 @@ const getGenderText = (gender: string) => {
       <main class="app-content-wrapper">
         <!-- 左側場地區 -->
         <section class="courts-section">
-          <div class="section-header">
-            <h2>🏸 場地動態 ({{ courts.length }} 個場地)</h2>
+          <!-- 上方：現正對局區 -->
+          <div class="courts-sub-section">
+            <div class="section-header">
+              <h2>🏸 現正對局 ({{ courts.length }} 個場地)</h2>
+            </div>
+
+            <div class="courts-grid-scroll-area">
+              <div class="courts-grid">
+                <div v-for="court in courts" :key="court.id" class="court-card" :class="court.status">
+                  <div class="court-header">
+                    <div class="title-with-status">
+                      <h3>{{ court.name }}</h3>
+                      <span class="status-badge" :class="court.status">
+                        {{ court.status === 'playing' ? '🔥 比賽中' : '⏳ 準備中' }}
+                      </span>
+                    </div>
+                    <div class="court-header-right">
+                      <span v-if="court.status === 'playing'" class="match-timer">⏱️ {{ formatTime(court.elapsedSeconds) }}</span>
+                      <span class="player-count" :class="{ 'full': court.players.length === 4 }">{{ court.players.length }} / 4人</span>
+                    </div>
+                  </div>
+
+                  <div class="zone-label">
+                    <span>🏸 上場球員 ({{ court.players.length }}/4)</span>
+                  </div>
+                  <draggable class="player-list court-player-list"
+                             v-model="court.players"
+                             v-bind="dragOptions"
+                             :disabled="court.status === 'playing'"
+                             :set-data="false"
+                             @add="handlePlayerAddedToCourt">
+                    <div v-for="player in court.players" :key="player.id" class="player-card touch-action-none">
+                      <div class="player-info">
+                        <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
+                        <span class="player-name">{{ player.name }}</span>
+                        <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+                      </div>
+                      <div class="player-stats">
+                        <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
+                        <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
+                          {{ player.playedCount }} / {{ getPlayerMaxGames(player) }}場
+                        </span>
+                      </div>
+                    </div>
+                  </draggable>
+
+                  <div class="court-actions">
+                    <button v-if="court.status === 'idle'" class="btn-start-match" @click="startMatch(court)">▶ 開始比賽</button>
+                    <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局 (自動遞補下局)</button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
-          <div class="courts-grid">
-            <div v-for="court in courts" :key="court.id" class="court-card" :class="court.status">
-              <div class="court-header">
-                <div class="title-with-status">
-                  <h3>{{ court.name }}</h3>
-                  <span class="status-badge" :class="court.status">
-                    {{ court.status === 'playing' ? '🔥 比賽中' : '⏳ 準備中' }}
-                  </span>
-                </div>
-                <div class="court-header-right">
-                  <span v-if="court.status === 'playing'" class="match-timer">⏱️ {{ formatTime(court.elapsedSeconds) }}</span>
-                  <span class="player-count" :class="{ 'full': court.players.length === 4 }">{{ court.players.length }} / 4人</span>
-                </div>
-              </div>
-
-              <!-- 現正對局 -->
-              <div class="zone-label">
-                <span>🏸 現正對局</span>
-              </div>
-              <draggable class="player-list court-player-list"
-                         v-model="court.players"
-                         v-bind="dragOptions"
-                         :disabled="court.status === 'playing'"
-                         :set-data="false"
-                         @add="handlePlayerAddedToCourt">
-                <div v-for="player in court.players" :key="player.id" class="player-card touch-action-none">
-                  <div class="player-info">
-                    <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
-                    <span class="player-name">{{ player.name }}</span>
-                    <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+          <!-- 下方：全場 4 個獨立的下局預備組 -->
+          <div class="courts-sub-section global-next-section">
+            <div class="section-header">
+              <h2>📋 全場統一下局預備區 (共 4 個預備組)</h2>
+            </div>
+            
+            <div class="global-next-scroll-area">
+              <div class="global-next-slots-grid">
+                <div v-for="(slotPlayers, sIdx) in globalNextSlots" :key="sIdx" class="next-slot-card">
+                  <div class="next-slot-header">
+                    <span>📋 預備組 {{ sIdx + 1 }}</span>
+                    <span class="slot-count" :class="{ 'full': slotPlayers.length === 4 }">{{ slotPlayers.length }}/4人</span>
                   </div>
-                  <div class="player-stats">
-                    <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
-                    <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
-                      {{ player.playedCount }} / {{ getPlayerMaxGames(player) }}場
-                    </span>
-                  </div>
+                  <draggable class="player-list global-next-container touch-action-none"
+                             v-model="globalNextSlots[sIdx]"
+                             v-bind="dragOptions"
+                             :set-data="false"
+                             @add="(evt) => handlePlayerAddedToGlobalNextSlot(sIdx, evt)">
+                    <div v-for="player in slotPlayers" :key="player.id" class="player-card is-next-up">
+                      <div class="player-info">
+                        <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
+                        <span class="player-name">{{ player.name }}</span>
+                        <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
+                      </div>
+                      <div class="player-stats">
+                        <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
+                        <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
+                          {{ player.playedCount }} / {{ getPlayerMaxGames(player) }}場
+                        </span>
+                      </div>
+                    </div>
+                    <div v-if="slotPlayers.length === 0" class="empty-next-tip">
+                      拖曳 4 人至此
+                    </div>
+                  </draggable>
                 </div>
-              </draggable>
-
-              <!-- 下局預備 -->
-              <div class="zone-label next-zone-label">
-                <span>📋 下局預備 ({{ court.nextPlayers.length }}/4)</span>
-              </div>
-              <draggable class="player-list court-player-list next-players-list"
-                         v-model="court.nextPlayers"
-                         v-bind="dragOptions"
-                         :set-data="false"
-                         @add="handlePlayerAddedToCourt">
-                <div v-for="player in court.nextPlayers" :key="player.id" class="player-card touch-action-none is-next-up">
-                  <div class="player-info">
-                    <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
-                    <span class="player-name">{{ player.name }}</span>
-                    <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
-                  </div>
-                  <div class="player-stats">
-                    <span class="level-tag" :class="getLevelClass(player.level)">{{ player.level }}級</span>
-                    <span class="played-tag" :class="{ 'limit-reached': isPlayerLimitReached(player) }">
-                      {{ player.playedCount }} / {{ getPlayerMaxGames(player) }}場
-                    </span>
-                  </div>
-                </div>
-              </draggable>
-
-              <div class="court-actions">
-                <button v-if="court.status === 'idle'" class="btn-start-match" @click="startMatch(court)">▶ 開始比賽</button>
-                <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局</button>
               </div>
             </div>
           </div>
@@ -1385,7 +1444,7 @@ const getGenderText = (gender: string) => {
                 <button class="btn-batch-delete" :disabled="selectedPlayerIds.length === 0" @click="batchDeletePlayers">🗑️ 刪除</button>
               </div>
             </div>
-            <span v-else class="header-tip">💡 點擊選手卡片可查看等待時間、上局夥伴或設定錯開名單</span>
+            <span v-else class="header-tip">💡 點擊選手卡片可設定夥伴、錯開名單或編輯資料</span>
           </div>
 
           <div class="queue-container">
@@ -1430,7 +1489,6 @@ const getGenderText = (gender: string) => {
                       <span v-else-if="isPlayerLimitReached(player)" class="completed-badge">🏁 完賽</span>
                     </div>
 
-                    <!-- ⏳ 顯示等待時間、上局夥伴與個人報名時段資訊 -->
                     <div class="player-extra-meta">
                       <span class="wait-time-badge" :class="{ 'warning-wait': getWaitSeconds(player) > 900 }">
                         ⏳ 等待: {{ formatWaitTime(getWaitSeconds(player)) }}
@@ -1494,7 +1552,7 @@ const getGenderText = (gender: string) => {
         </div>
       </div>
 
-      <!-- Modal: 編輯選手 (含時段、錯開設定與搭檔綁定) -->
+      <!-- Modal: 編輯選手 -->
       <div v-if="isEditModalOpen && editingPlayer" class="modal-overlay" @click.self="closeEditModal">
         <div class="modal-card">
           <div class="modal-header">
@@ -1507,7 +1565,6 @@ const getGenderText = (gender: string) => {
               <input type="text" v-model="editingPlayer.name" class="form-input" />
             </div>
 
-            <!-- ⏰ 選手報名時段設定 -->
             <div class="form-group">
               <label>⏰ 報名時段 (可複選)：</label>
               <div class="checkbox-group">
@@ -1531,7 +1588,6 @@ const getGenderText = (gender: string) => {
               </select>
             </div>
 
-            <!-- ⛔ 避開特定球員設定 -->
             <div class="form-group">
               <label>⛔ 避開特定球員 (不同場，可多選)：</label>
               <div class="checkbox-group avoid-checkboxes">
@@ -1660,7 +1716,7 @@ const getGenderText = (gender: string) => {
 .divider { border: none; border-top: 1px dashed #e2e8f0; margin: 14px 0; }
 .preview-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .btn-clear-all { background-color: #ef4444; color: white; border: none; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
-.empty-tip { font-size: 0.85rem; color: #94a3b8; padding: 12px 0; }
+.empty-tip { font-size: 0.8rem; color: #94a3b8; text-align: center; padding: 8px 0; }
 .preview-player-tags { display: flex; flex-direction: column; gap: 8px; flex: 1; overflow-y: auto; padding: 8px; background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 520px; }
 .preview-tag { display: flex; align-items: center; justify-content: space-between; background-color: #ffffff; border: 1px solid #cbd5e1; padding: 6px 10px; border-radius: 8px; font-size: 0.825rem; }
 
@@ -1696,10 +1752,52 @@ const getGenderText = (gender: string) => {
 .court-selector select { padding: 2px 6px; border-radius: 6px; border: 1px solid #475569; background-color: #0f172a; color: white; font-weight: 600; outline: none; }
 
 .app-content-wrapper { max-width: 1600px; margin: 12px auto 0 auto; padding: 0 12px 12px 12px; display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; box-sizing: border-box; }
-.courts-section { display: flex; flex-direction: column; width: 100%; min-width: 0; max-height: calc(100vh - 120px); overflow-y: auto; padding-right: 4px; }
-.queue-section { background: #ffffff; border-radius: 14px; padding: 12px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03); border: 1px solid #e2e8f0; display: flex; flex-direction: column; gap: 10px; max-height: calc(100vh - 120px); position: sticky; top: 80px; overflow-y: auto; box-sizing: border-box; }
 
-.section-header { margin-bottom: 6px; display: flex; flex-direction: column; gap: 6px; }
+.courts-section { 
+  display: flex; 
+  flex-direction: column; 
+  width: 100%; 
+  min-width: 0; 
+  gap: 16px;
+}
+
+.courts-sub-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.courts-grid-scroll-area {
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.global-next-scroll-area {
+  max-height: 240px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+/* 🌟 修正手機/平板右側等待佇列無法往下滑動的問題 */
+.queue-section { 
+  background: #ffffff; 
+  border-radius: 14px; 
+  padding: 12px; 
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03); 
+  border: 1px solid #e2e8f0; 
+  display: flex; 
+  flex-direction: column; 
+  gap: 10px; 
+  max-height: calc(100vh - 120px); 
+  position: sticky; 
+  top: 80px; 
+  overflow-y: auto; 
+  box-sizing: border-box; 
+  -webkit-overflow-scrolling: touch; /* 提升 iOS 觸控滾動滑順度 */
+}
+
+.section-header { margin-bottom: 4px; display: flex; flex-direction: column; gap: 6px; }
 .section-header h2 { font-size: 1.05rem; margin: 0; color: #0f172a; font-weight: 700; }
 .header-title-group { display: flex; justify-content: space-between; align-items: center; }
 .header-tip { font-size: 0.725rem; color: #64748b; }
@@ -1717,7 +1815,15 @@ const getGenderText = (gender: string) => {
 .status-badge.playing { background: #dbeafe; color: #1d4ed8; }
 
 .zone-label { font-size: 0.7rem; font-weight: 700; color: #475569; display: flex; align-items: center; gap: 4px; }
-.next-zone-label { margin-top: 2px; color: #64748b; }
+
+.global-next-section { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03); }
+.global-next-slots-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.next-slot-card { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.next-slot-header { display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; font-weight: bold; color: #334155; }
+.slot-count { font-size: 0.7rem; background: #e2e8f0; color: #475569; padding: 1px 6px; border-radius: 4px; }
+.slot-count.full { background-color: #dcfce7; color: #15803d; }
+
+.global-next-container { min-height: 60px; background-color: #ffffff; border: 1.5px dashed #cbd5e1; border-radius: 6px; padding: 4px; display: flex; flex-direction: column; gap: 4px; }
 
 .player-list { min-height: 70px; background-color: #f8fafc; border: 1.5px dashed #cbd5e1; border-radius: 8px; padding: 5px; display: flex; flex-direction: column; gap: 5px; }
 .player-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px 8px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03); cursor: grab; user-select: none; }
@@ -1773,7 +1879,7 @@ const getGenderText = (gender: string) => {
 .btn-batch-reset { background-color: #6366f1; color: white; }
 .btn-batch-delete { background-color: #ef4444; color: white; }
 
-.queue-container { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-right: 2px; flex: 1; }
+.queue-container { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-right: 2px; flex: 1; max-height: 55vh; }
 .queue-group { display: flex; flex-direction: column; }
 .group-header { display: flex; justify-content: space-between; align-items: center; padding: 5px 8px; background-color: #f1f5f9; border-radius: 6px; font-size: 0.8rem; font-weight: bold; margin-bottom: 4px; color: #334155; user-select: none; }
 .group-title { display: flex; align-items: center; gap: 4px; }
@@ -1818,7 +1924,16 @@ const getGenderText = (gender: string) => {
   .setup-grid { grid-template-columns: 1fr; }
   .app-content-wrapper { grid-template-columns: 1fr; gap: 14px; }
   .courts-section { max-height: none; overflow-y: visible; }
-  .queue-section { position: static; max-height: 450px; }
+  .queue-section { 
+    position: static; 
+    max-height: none; 
+    overflow-y: visible; 
+  }
+  .queue-container {
+    max-height: 500px;
+    overflow-y: auto;
+  }
   .courts-grid { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+  .global-next-slots-grid { grid-template-columns: 1fr; }
 }
 </style>
