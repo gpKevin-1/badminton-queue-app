@@ -10,6 +10,7 @@ export interface Player {
   playedCount: number;
   level: string; // 1 ~ 15 級
   status?: '1' | '0'; // '1': 排隊中/比賽中, '0': 休息/請假
+  isPaid?: boolean;   // 💰 是否已繳費
   sessions: string[]; // 選手報名的時段標籤
   partnerId?: number | string | null; // 👥 綁定搭檔 ID
   queueEnteredAt?: number | null;     // ⏳ 進入等待佇列的時間戳記
@@ -27,7 +28,7 @@ export interface MatchHistoryRecord {
 export interface Court {
   id: number;
   name: string;
-  players: Player[];        // 目前正在場上的球員 (4人)
+  players: Player[];        // 目前正在場上的球員
   status: 'idle' | 'playing';
   startTime?: number | null;
   elapsedSeconds?: number;
@@ -83,6 +84,16 @@ const sortedTimeSlots = computed(() => {
 
 const queuePlayers = ref<Player[]>([]);
 const globalNextSlots = ref<Player[][]>([[], [], [], []]);
+const courts = ref<Court[]>([]);
+
+// 🌟 核心修正：計算所有已報名的總球員 (等待佇列 + 場地上 + 預備組)
+const allPlayers = computed(() => {
+  const map = new Map<string | number, Player>();
+  queuePlayers.value.forEach(p => map.set(p.id, p));
+  courts.value.forEach(c => c.players.forEach(p => map.set(p.id, p)));
+  globalNextSlots.value.forEach(slot => slot.forEach(p => map.set(p.id, p)));
+  return Array.from(map.values());
+});
 
 const matchHistories = ref<MatchHistoryRecord[]>([]);
 const isLoading = ref<boolean>(false);
@@ -93,6 +104,7 @@ const currentTime = ref<number>(Date.now());
 const batchText = ref<string>('');
 const batchDefaultGender = ref<string>('-');
 const batchDefaultLevel = ref<string>('5');
+const batchDefaultIsPaid = ref<boolean>(false);
 const batchDefaultSessions = ref<string[]>([...DEFAULT_TIME_SLOTS]);
 
 const isEditModalOpen = ref<boolean>(false);
@@ -104,7 +116,8 @@ const newPlayer = ref<Omit<Player, 'id'>>({
   gender: '-',
   playedCount: 0,
   level: '5',
-  status: '1',
+  status: '0',     // 預設休息中
+  isPaid: false,   // 預設未繳費
   sessions: [...DEFAULT_TIME_SLOTS],
   partnerId: null,
   avoidIds: []
@@ -119,8 +132,6 @@ const collapsedGroups = ref<Record<string, boolean>>({
   fresh: false, moderate: false, veteran: false,
   restingGroup: false, completedGroup: false
 });
-
-const courts = ref<Court[]>([]);
 
 const getPlayerMaxGames = (player: Player): number => {
   if (!player.sessions || player.sessions.length === 0) {
@@ -140,7 +151,7 @@ const isPlayerLimitReached = (player: Player): boolean => {
 
 const getPartner = (player: Player): Player | undefined => {
   if (!player.partnerId) return undefined;
-  return queuePlayers.value.find(p => String(p.id) === String(player.partnerId));
+  return allPlayers.value.find(p => String(p.id) === String(player.partnerId));
 };
 
 const getWaitSeconds = (player: Player): number => {
@@ -287,6 +298,8 @@ const loadFromLocalStorage = () => {
       const parsedPlayers = JSON.parse(playerData);
       queuePlayers.value = parsedPlayers.map((p: any) => ({
         ...p,
+        status: p.status !== undefined ? p.status : '0',
+        isPaid: p.isPaid ?? false,
         sessions: Array.isArray(p.sessions) ? p.sessions : (sessionConfig.value.timeSlots.slice(0, 1)),
         partnerId: p.partnerId || null,
         queueEnteredAt: p.queueEnteredAt || now,
@@ -299,10 +312,10 @@ const loadFromLocalStorage = () => {
   } else {
     const defaultSlots = sessionConfig.value.timeSlots;
     queuePlayers.value = [
-      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '1', sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
-      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '1', sessions: [defaultSlots[0] || '19:30-22:30'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
-      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '1', sessions: [defaultSlots[1] || '22:30-23:30'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
-      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '1', sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] }
+      { id: 1, name: '戴資穎', gender: 'F', playedCount: 0, level: '15', status: '0', isPaid: false, sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 2, name: '林丹', gender: 'M', playedCount: 0, level: '15', status: '0', isPaid: false, sessions: [defaultSlots[0] || '19:30-22:30'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 3, name: '周天成', gender: 'M', playedCount: 0, level: '11', status: '0', isPaid: false, sessions: [defaultSlots[1] || '22:30-23:30'], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] },
+      { id: 4, name: '山口茜', gender: 'F', playedCount: 0, level: '14', status: '0', isPaid: false, sessions: [...defaultSlots], partnerId: null, queueEnteredAt: now, lastMatchPeers: [], avoidIds: [] }
     ];
   }
   initCourts(sessionConfig.value.courtCount);
@@ -312,7 +325,7 @@ const addOrMergePlayer = (playerData: Omit<Player, 'id'>, nowTimestamp: number, 
   const cleanName = playerData.name.trim();
   if (!cleanName) return false;
 
-  const existingPlayer = queuePlayers.value.find(p => p.name.trim() === cleanName);
+  const existingPlayer = allPlayers.value.find(p => p.name.trim() === cleanName);
 
   if (existingPlayer) {
     const combinedSessions = Array.from(new Set([...existingPlayer.sessions, ...playerData.sessions]));
@@ -397,7 +410,8 @@ const parseAndImportText = () => {
       gender,
       level,
       playedCount: 0,
-      status: '1',
+      status: '0', // 預設休息中
+      isPaid: batchDefaultIsPaid.value,
       sessions: finalSessions,
       partnerId: null,
       avoidIds: []
@@ -465,7 +479,8 @@ const handleFileUpload = (event: Event) => {
         gender,
         level,
         playedCount: 0,
-        status: '1',
+        status: '0', // 預設休息中
+        isPaid: batchDefaultIsPaid.value,
         sessions,
         partnerId: null,
         avoidIds: []
@@ -635,18 +650,6 @@ const handlePlayerAddedToCourt = (evt: any) => {
     return;
   }
 
-  const targetListEl = evt.to;
-  const courtId = Number(targetListEl.dataset.courtId);
-  const targetCourt = courts.value.find(c => c.id === courtId);
-
-  if (targetCourt && targetCourt.players.length > 4) {
-    const swappedPlayer = targetCourt.players.shift();
-    if (swappedPlayer && String(swappedPlayer.id) !== String(player.id)) {
-      swappedPlayer.queueEnteredAt = Date.now();
-      queuePlayers.value.push(swappedPlayer);
-    }
-  }
-
   const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
   if (idx !== -1) {
     queuePlayers.value.splice(idx, 1);
@@ -657,14 +660,6 @@ const handlePlayerAddedToCourt = (evt: any) => {
 const handlePlayerAddedToGlobalNextSlot = (slotIndex: number, evt: any) => {
   const player = getDraggedPlayer(evt);
   if (!player) return;
-
-  if (globalNextSlots.value[slotIndex].length > 4) {
-    const swapped = globalNextSlots.value[slotIndex].shift();
-    if (swapped && String(swapped.id) !== String(player.id)) {
-      swapped.queueEnteredAt = Date.now();
-      queuePlayers.value.push(swapped);
-    }
-  }
 
   const idx = queuePlayers.value.findIndex(p => String(p.id) === String(player.id));
   if (idx !== -1) {
@@ -692,8 +687,8 @@ const handlePlayerAddedToQueue = (evt: any) => {
 };
 
 const openAddModal = () => {
-  if (queuePlayers.value.length >= sessionConfig.value.maxPlayersCount) {
-    if (!confirm(`目前人數 (${queuePlayers.value.length}人) 已達到上限 (${sessionConfig.value.maxPlayersCount}人)，確定要繼續新增嗎？`)) {
+  if (allPlayers.value.length >= sessionConfig.value.maxPlayersCount) {
+    if (!confirm(`目前總人數 (${allPlayers.value.length}人) 已達到上限 (${sessionConfig.value.maxPlayersCount}人)，確定要繼續新增嗎？`)) {
       return;
     }
   }
@@ -702,7 +697,8 @@ const openAddModal = () => {
     gender: '-', 
     playedCount: 0, 
     level: '5', 
-    status: '1',
+    status: '0',    // 預設休息中
+    isPaid: false,  // 預設未繳費
     sessions: [...sessionConfig.value.timeSlots],
     partnerId: null,
     avoidIds: []
@@ -720,7 +716,8 @@ const saveNewPlayer = () => {
     gender: newPlayer.value.gender,
     playedCount: Number(newPlayer.value.playedCount || 0),
     level: String(newPlayer.value.level),
-    status: newPlayer.value.status || '1',
+    status: newPlayer.value.status || '0',
+    isPaid: newPlayer.value.isPaid ?? false,
     sessions: newPlayer.value.sessions && newPlayer.value.sessions.length > 0 
       ? [...newPlayer.value.sessions] 
       : [...sessionConfig.value.timeSlots],
@@ -753,35 +750,38 @@ const savePlayerEdit = () => {
   const targetId = editingPlayer.value.id;
   const newPartnerId = editingPlayer.value.partnerId ? String(editingPlayer.value.partnerId) : null;
 
-  const oldPlayer = queuePlayers.value.find(p => String(p.id) === String(targetId));
-  const oldPartnerId = oldPlayer?.partnerId ? String(oldPlayer.partnerId) : null;
-
-  queuePlayers.value = queuePlayers.value.map(p => {
+  const updatePlayerObj = (p: Player): Player => {
     if (String(p.id) === String(targetId)) {
       return { ...editingPlayer.value!, partnerId: newPartnerId };
     }
     return p;
+  };
+
+  queuePlayers.value = queuePlayers.value.map(updatePlayerObj);
+  courts.value.forEach(court => {
+    court.players = court.players.map(updatePlayerObj);
+  });
+  globalNextSlots.value.forEach((slot, idx) => {
+    globalNextSlots.value[idx] = slot.map(updatePlayerObj);
   });
 
+  const oldPlayer = allPlayers.value.find(p => String(p.id) === String(targetId));
+  const oldPartnerId = oldPlayer?.partnerId ? String(oldPlayer.partnerId) : null;
+
   if (oldPartnerId !== newPartnerId) {
-    if (oldPartnerId) {
-      queuePlayers.value.forEach(p => {
-        if (String(p.id) === oldPartnerId && String(p.partnerId) === String(targetId)) {
-          p.partnerId = null;
+    const clearPartner = (p: Player) => {
+      if (String(p.id) === oldPartnerId && String(p.partnerId) === String(targetId)) {
+        p.partnerId = null;
+      }
+      if (newPartnerId && String(p.id) === newPartnerId) {
+        if (p.partnerId && String(p.partnerId) !== String(targetId)) {
+          const prevPartner = allPlayers.value.find(x => String(x.id) === String(p.partnerId));
+          if (prevPartner) prevPartner.partnerId = null;
         }
-      });
-    }
-    if (newPartnerId) {
-      queuePlayers.value.forEach(p => {
-        if (String(p.id) === newPartnerId) {
-          if (p.partnerId && String(p.partnerId) !== String(targetId)) {
-            const prevPartner = queuePlayers.value.find(x => String(x.id) === String(p.partnerId));
-            if (prevPartner) prevPartner.partnerId = null;
-          }
-          p.partnerId = targetId;
-        }
-      });
-    }
+        p.partnerId = targetId;
+      }
+    };
+    allPlayers.value.forEach(clearPartner);
   }
 
   saveToLocalStorage();
@@ -828,6 +828,19 @@ const updateBatchStatus = (targetStatus: '0' | '1') => {
   isBatchMode.value = false;
 };
 
+// 批次更新繳費狀態
+const updateBatchPaid = (targetPaid: boolean) => {
+  if (selectedPlayerIds.value.length === 0) return;
+  queuePlayers.value.forEach(p => {
+    if (selectedPlayerIds.value.includes(p.id)) {
+      p.isPaid = targetPaid;
+    }
+  });
+  saveToLocalStorage();
+  selectedPlayerIds.value = [];
+  isBatchMode.value = false;
+};
+
 const batchResetPlayedCount = () => {
   if (selectedPlayerIds.value.length === 0) return;
   if (!confirm(`確定要將選中的 ${selectedPlayerIds.value.length} 位選手已打場數歸零嗎？`)) return;
@@ -846,29 +859,44 @@ const batchDeletePlayers = () => {
   if (selectedPlayerIds.value.length === 0) return;
   if (!confirm(`確定要刪除選中的 ${selectedPlayerIds.value.length} 位選手嗎？`)) return;
 
-  queuePlayers.value.forEach(p => {
+  allPlayers.value.forEach(p => {
     if (p.partnerId && selectedPlayerIds.value.includes(p.partnerId)) {
       p.partnerId = null;
     }
   });
 
   queuePlayers.value = queuePlayers.value.filter(p => !selectedPlayerIds.value.includes(p.id));
+  courts.value.forEach(c => {
+    c.players = c.players.filter(p => !selectedPlayerIds.value.includes(p.id));
+  });
+  globalNextSlots.value.forEach((slot, idx) => {
+    globalNextSlots.value[idx] = slot.filter(p => !selectedPlayerIds.value.includes(p.id));
+  });
+
   saveToLocalStorage();
   selectedPlayerIds.value = [];
   isBatchMode.value = false;
 };
 
 const removeSinglePlayerInSetup = (id: number | string) => {
-  queuePlayers.value.forEach(p => {
+  allPlayers.value.forEach(p => {
     if (String(p.partnerId) === String(id)) p.partnerId = null;
   });
   queuePlayers.value = queuePlayers.value.filter(p => String(p.id) !== String(id));
+  courts.value.forEach(c => {
+    c.players = c.players.filter(p => String(p.id) !== String(id));
+  });
+  globalNextSlots.value.forEach((slot, idx) => {
+    globalNextSlots.value[idx] = slot.filter(p => String(p.id) !== String(id));
+  });
   saveToLocalStorage();
 };
 
 const clearAllPlayersInSetup = () => {
   if (confirm('確定要清空目前所有的選手報名名單嗎？')) {
     queuePlayers.value = [];
+    courts.value.forEach(c => (c.players = []));
+    globalNextSlots.value = [[], [], [], []];
     saveToLocalStorage();
   }
 };
@@ -999,11 +1027,11 @@ const addPlayerToAvailableCourt = (player: Player) => {
   }
 
   const partner = getPartner(player);
-  const neededSlots = partner ? 2 : 1;
-
   if (partner && isPlayerLimitReached(partner)) {
     return alert(`搭檔【${partner.name}】已打滿個人上限，無法一起上場！`);
   }
+
+  const neededSlots = partner ? 2 : 1;
 
   const targetCourt = courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots && isPreferredLevel(c.players, player))
     || courts.value.find(c => c.status === 'idle' && (4 - c.players.length) >= neededSlots);
@@ -1042,7 +1070,7 @@ const addPlayerToAvailableCourt = (player: Player) => {
       }
     }
     if (!placed) {
-      return alert('所有 4 個預備組目前空間皆已滿！');
+      return alert('所有 4 個預備組目前空間皆不足以容納此選手（或雙人搭檔）！');
     }
   }
 
@@ -1051,7 +1079,7 @@ const addPlayerToAvailableCourt = (player: Player) => {
 
 const startMatch = (court: Court) => {
   if (court.players.length !== 4) {
-    return alert(`【${court.name}】目前有 ${court.players.length} 人，必須湊齊 4 人才能開始比賽！`);
+    return alert(`【${court.name}】目前有 ${court.players.length} 人, 必須 4 人才能開始比賽！`);
   }
   court.status = 'playing';
   court.startTime = Date.now();
@@ -1080,20 +1108,20 @@ const finishMatch = (courtId: number) => {
     }
   });
 
-  if (globalNextSlots.value[0].length > 0) {
-    court.players = [...globalNextSlots.value[0]];
-  } else {
-    court.players = [];
-  }
-
-  globalNextSlots.value[0] = [...globalNextSlots.value[1]];
-  globalNextSlots.value[1] = [...globalNextSlots.value[2]];
-  globalNextSlots.value[2] = [...globalNextSlots.value[3]];
-  globalNextSlots.value[3] = [];
-  
+  court.players = [];
   court.status = 'idle';
   court.startTime = null;
   court.elapsedSeconds = 0;
+
+  if (globalNextSlots.value[0] && globalNextSlots.value[0].length === 4) {
+    court.players = [...globalNextSlots.value[0]];
+    court.status = 'idle';
+  }
+
+  globalNextSlots.value[0] = globalNextSlots.value[1] || [];
+  globalNextSlots.value[1] = globalNextSlots.value[2] || [];
+  globalNextSlots.value[2] = globalNextSlots.value[3] || [];
+  globalNextSlots.value[3] = [];
 
   saveToLocalStorage();
 };
@@ -1229,6 +1257,13 @@ const getGenderText = (gender: string) => {
                 <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
               </select>
             </div>
+            <div class="default-item">
+              <label>預設繳費：</label>
+              <select v-model="batchDefaultIsPaid" class="small-select">
+                <option :value="false">❌ 未繳費</option>
+                <option :value="true">✅ 已繳費</option>
+              </select>
+            </div>
           </div>
 
           <div class="batch-sessions-select">
@@ -1265,16 +1300,17 @@ const getGenderText = (gender: string) => {
 
         <div class="setup-card preview-card">
           <div class="setup-header preview-header">
-            <h3>👥 已報名選手名單 ({{ queuePlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
-            <button class="btn-clear-all" @click="clearAllPlayersInSetup" v-if="queuePlayers.length > 0">🗑 清空</button>
+            <h3>👥 已報名選手名單 ({{ allPlayers.length }} / {{ sessionConfig.maxPlayersCount }} 人)</h3>
+            <button class="btn-clear-all" @click="clearAllPlayersInSetup" v-if="allPlayers.length > 0">🗑 清空</button>
           </div>
 
-          <div v-if="queuePlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用中間批次報名工具。</div>
+          <div v-if="allPlayers.length === 0" class="empty-tip">目前尚無選手報名，請使用中間批次報名工具。</div>
           <div v-else class="preview-player-tags custom-scrollbar">
-            <div v-for="p in queuePlayers" :key="p.id" class="preview-tag">
+            <div v-for="p in allPlayers" :key="p.id" class="preview-tag">
               <span v-if="getGenderText(p.gender)" class="p-gender" :class="p.gender === 'M' ? 'male' : 'female'">{{ getGenderText(p.gender) }}</span>
               <span class="p-name">{{ p.name }}</span>
               <span class="p-level">{{ p.level }}級</span>
+              <span class="p-sessions-text" v-if="p.sessions && p.sessions.length > 0">⏰ {{ p.sessions.join(', ') }}</span>
               <span class="p-partner" v-if="getPartner(p)">🔗 {{ getPartner(p)?.name }}</span>
               <button class="btn-remove-tag" @click="removeSinglePlayerInSetup(p.id)">✕</button>
             </div>
@@ -1360,6 +1396,7 @@ const getGenderText = (gender: string) => {
                       <div class="player-info">
                         <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
                         <span class="player-name">{{ player.name }}</span>
+                        <span class="paid-indicator" :class="player.isPaid ? 'paid' : 'unpaid'">{{ player.isPaid ? '💰' : '⏳' }}</span>
                         <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
                       </div>
                       <div class="player-stats">
@@ -1373,7 +1410,7 @@ const getGenderText = (gender: string) => {
 
                   <div class="court-actions">
                     <button v-if="court.status === 'idle'" class="btn-start-match" @click="startMatch(court)">▶ 開始比賽</button>
-                    <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局 (自動遞補下局)</button>
+                    <button v-if="court.status === 'playing'" class="btn-finish-match" @click="finishMatch(court.id)" :disabled="isLoading">🏁 結束此局 (放回等待區)</button>
                   </div>
                 </div>
               </div>
@@ -1402,6 +1439,7 @@ const getGenderText = (gender: string) => {
                       <div class="player-info">
                         <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
                         <span class="player-name">{{ player.name }}</span>
+                        <span class="paid-indicator" :class="player.isPaid ? 'paid' : 'unpaid'">{{ player.isPaid ? '💰' : '⏳' }}</span>
                         <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
                       </div>
                       <div class="player-stats">
@@ -1453,11 +1491,14 @@ const getGenderText = (gender: string) => {
                 <button v-if="queueGroupMode === 'resting'" class="btn-batch-active" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('1')">🟢 設為上場</button>
                 <button v-else class="btn-batch-rest" :disabled="selectedPlayerIds.length === 0" @click="updateBatchStatus('0')">💤 設為休息</button>
 
+                <button class="btn-batch-paid" :disabled="selectedPlayerIds.length === 0" @click="updateBatchPaid(true)">💰 設已繳費</button>
+                <button class="btn-batch-unpaid" :disabled="selectedPlayerIds.length === 0" @click="updateBatchPaid(false)">⏳ 設未繳費</button>
+
                 <button class="btn-batch-reset" :disabled="selectedPlayerIds.length === 0" @click="batchResetPlayedCount">🔄 場次歸零</button>
                 <button class="btn-batch-delete" :disabled="selectedPlayerIds.length === 0" @click="batchDeletePlayers">🗑️ 刪除</button>
               </div>
             </div>
-            <span v-else class="header-tip">💡 點擊選手卡片可設定夥伴、錯開名單或編輯資料</span>
+            <span v-else class="header-tip">💡 點擊選手卡片可設定夥伴、繳費或編輯資料</span>
           </div>
 
           <div class="queue-container custom-scrollbar">
@@ -1497,6 +1538,7 @@ const getGenderText = (gender: string) => {
                     <div class="player-info">
                       <span v-if="getGenderText(player.gender)" class="player-gender" :class="player.gender === 'M' ? 'male' : 'female'">{{ getGenderText(player.gender) }}</span>
                       <span class="player-name">{{ player.name }}</span>
+                      <span class="paid-badge" :class="player.isPaid ? 'paid' : 'unpaid'">{{ player.isPaid ? '💰已繳' : '⏳未繳' }}</span>
                       <span v-if="getPartner(player)" class="partner-badge">🔗 {{ getPartner(player)?.name }}</span>
                       <span v-if="String(player.status) === '0'" class="resting-badge">💤 休息</span>
                       <span v-else-if="isPlayerLimitReached(player)" class="completed-badge">🏁 完賽</span>
@@ -1557,6 +1599,13 @@ const getGenderText = (gender: string) => {
                 <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
               </select>
             </div>
+            <div class="form-group">
+              <label>是否繳費：</label>
+              <select v-model="newPlayer.isPaid" class="form-select">
+                <option :value="false">❌ 未繳費</option>
+                <option :value="true">✅ 已繳費</option>
+              </select>
+            </div>
           </div>
           <div class="modal-footer">
             <button class="btn-cancel" @click="closeAddModal">取消</button>
@@ -1593,7 +1642,7 @@ const getGenderText = (gender: string) => {
               <select v-model="editingPlayer.partnerId" class="form-select">
                 <option :value="null">-- 無搭檔 (單人排隊) --</option>
                 <option 
-                  v-for="p in queuePlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" 
+                  v-for="p in allPlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" 
                   :key="p.id" 
                   :value="p.id">
                   {{ p.name }} ({{ p.level }}級)
@@ -1604,7 +1653,7 @@ const getGenderText = (gender: string) => {
             <div class="form-group">
               <label>⛔ 避開特定球員 (不同場，可多選)：</label>
               <div class="checkbox-group avoid-checkboxes">
-                <label v-for="p in queuePlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" :key="p.id" class="checkbox-item">
+                <label v-for="p in allPlayers.filter(x => String(x.id) !== String(editingPlayer?.id))" :key="p.id" class="checkbox-item">
                   <input type="checkbox" :value="p.id" v-model="editingPlayer.avoidIds" />
                   <span>{{ p.name }} ({{ p.level }}級)</span>
                 </label>
@@ -1624,6 +1673,13 @@ const getGenderText = (gender: string) => {
               <label>實力等級：</label>
               <select v-model="editingPlayer.level" class="form-select">
                 <option v-for="n in 15" :key="n" :value="String(n)">{{ n }} 級</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>是否繳費：</label>
+              <select v-model="editingPlayer.isPaid" class="form-select">
+                <option :value="false">❌ 未繳費</option>
+                <option :value="true">✅ 已繳費</option>
               </select>
             </div>
             <div class="form-group">
@@ -1765,14 +1821,21 @@ const getGenderText = (gender: string) => {
 .btn-clear-all { background-color: #ef4444; color: white; border: none; padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
 .empty-tip { font-size: 0.8rem; color: #94a3b8; text-align: center; padding: 8px 0; }
 .preview-player-tags { display: flex; flex-direction: column; gap: 8px; flex: 1; overflow-y: auto; padding: 8px; background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; max-height: 520px; }
-.preview-tag { display: flex; align-items: center; justify-content: space-between; background-color: #ffffff; border: 1px solid #cbd5e1; padding: 6px 10px; border-radius: 8px; font-size: 0.825rem; }
+.preview-tag { display: flex; align-items: center; justify-content: space-between; background-color: #ffffff; border: 1px solid #cbd5e1; padding: 6px 10px; border-radius: 8px; font-size: 0.825rem; flex-wrap: wrap; gap: 4px; }
 
 .p-gender.male { color: #2563eb; font-weight: bold; }
 .p-gender.female { color: #ec4899; font-weight: bold; }
-.p-name { font-weight: 600; flex: 1; margin: 0 6px; color: #1e293b; }
+.p-name { font-weight: 600; margin: 0 4px; color: #1e293b; }
 .p-level { color: #475569; font-size: 0.75rem; background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+.p-sessions-text { font-size: 0.72rem; background-color: #e0f2fe; color: #0369a1; padding: 1px 6px; border-radius: 4px; font-weight: 600; margin-left: 4px; }
+
+.paid-badge { font-size: 0.65rem; padding: 1px 4px; border-radius: 4px; font-weight: 600; }
+.paid-badge.paid { background-color: #dcfce7; color: #15803d; }
+.paid-badge.unpaid { background-color: #fef3c7; color: #b45309; }
+.paid-indicator { font-size: 0.75rem; margin-left: 2px; }
+
 .p-partner { font-size: 0.72rem; background-color: #fef3c7; color: #92400e; padding: 1px 6px; border-radius: 4px; margin-left: 4px; }
-.btn-remove-tag { border: none; background: transparent; color: #94a3b8; cursor: pointer; font-weight: bold; }
+.btn-remove-tag { border: none; background: transparent; color: #94a3b8; cursor: pointer; font-weight: bold; margin-left: auto; }
 
 .app-header { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: #ffffff; padding: 12px 16px; position: sticky; top: 0; z-index: 100; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12); flex-shrink: 0; }
 .header-content { max-width: 1600px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
@@ -1935,6 +1998,8 @@ const getGenderText = (gender: string) => {
 .batch-btns button { padding: 3px 6px; font-size: 0.7rem; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; }
 .btn-batch-active { background-color: #10b981; color: white; }
 .btn-batch-rest { background-color: #f59e0b; color: white; }
+.btn-batch-paid { background-color: #059669; color: white; }
+.btn-batch-unpaid { background-color: #d97706; color: white; }
 .btn-batch-reset { background-color: #6366f1; color: white; }
 .btn-batch-delete { background-color: #ef4444; color: white; }
 
@@ -1951,7 +2016,7 @@ const getGenderText = (gender: string) => {
 .history-modal-card { max-width: 600px; }
 .history-modal-body { max-height: 400px; overflow-y: auto; }
 
-.modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
+.modal-header { display: flex; justify-name: space-name; align-items: center; margin-bottom: 12px; border-bottom: 1px solid #f1f5f9; padding-bottom: 6px; }
 .modal-header h3 { margin: 0; font-size: 1rem; color: #0f172a; }
 .btn-close { border: none; background: transparent; font-size: 1rem; color: #94a3b8; cursor: pointer; }
 .modal-body { display: flex; flex-direction: column; gap: 10px; }
